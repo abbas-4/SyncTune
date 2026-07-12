@@ -1,0 +1,40 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+/build
+
+# environment — never commit secrets
+.env
+.env.*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# testing
+/coverage
+
+# supabase local artifacts
+supabase/.temp
+supabase/.branches
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# editors & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# misc
+*.pem
