@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SynceTune — Spotify → YouTube</title>
+<meta name="description" content="Paste a Spotify playlist link, get a YouTube playlist. No login, no API keys.">
+<!--
+  SynceTune (v3) — three files, same folder:
+    index.html   this file — open it
+    styles.css   look and feel
+    app.js       all the logic
+
+  Paste a Spotify playlist link → Transfer → Open on YouTube → Save playlist.
+  No login, no API keys, no quotas, no backend.
+
+  Works by double-clicking index.html, or host the folder anywhere static.
+  Keep all three files together or the page will load unstyled and do nothing.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://api.allorigins.win" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,800&family=Spline+Sans+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <h1>Synce<span>Tune</span></h1>
+    <p class="tag">Spotify → YouTube in a few clicks. No login, no keys, free.</p>
+  </header>
+
+  <section class="card">
+    <textarea id="in" spellcheck="false" rows="3"
+      placeholder="Paste a Spotify playlist link&#10;https://open.spotify.com/playlist/…&#10;(a pasted tracklist works too)"></textarea>
+
+    <div class="row">
+      <button class="btn btn-primary" id="go">Transfer →</button>
+      <button class="btn btn-sm" id="stop" hidden>Stop</button>
+      <span class="status" id="status" role="status" aria-live="polite"></span>
+    </div>
+    <div class="bar" id="bar"><div class="bar-fill" id="barFill"></div></div>
+
+    <div class="notice" id="netNotice" hidden></div>
+  </section>
+
+  <section class="card" id="result" hidden></section>
+
+  <footer class="foot">
+    <p>Runs entirely in your browser. It reads Spotify's public embed page through a free relay and matches songs
+    via public YouTube search instances (Piped / Invidious) — no account touched, nothing uploaded.
+    Matches are remembered on this device, so running the same playlist again is instant. Public playlists, up to 188 tracks per run.</p>
+  </footer>
+</div>
+
+<script src="app.js" defer></script>
+</body>
+</html>
