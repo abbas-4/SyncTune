@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
 import './App.css';
+import YouTubeTestPanel from './YouTubeTestPanel';
+import {
+  ApiError,
+  CONNECT_URL,
+  addVideosToPlaylist,
+  fetchConnection,
+  matchTrack,
+  newTransferId,
+} from './youtubeApi';
+import type { Connection, TrackMatch } from './youtubeApi';
+import { SPOTIFY_CONNECT_URL, fetchMyPlaylists, fetchSpotifyStatus, importPlaylist, parsePlaylistId } from './spotifyApi';
+import type { SpotifyConnection, SpotifyPlaylistSummary, SpotifyStatus } from './spotifyApi';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -23,12 +35,23 @@ interface Track {
   demoOutcome?: Outcome;
 }
 
-interface MatchResult {
-  outcome: Outcome;
-  videoTitle: string;
-  channel: string;
-  /** 0–100 */
-  confidence: number;
+/** A track's best YouTube video; videoId is missing for "Not found" and demo tracks. */
+type MatchResult = TrackMatch;
+
+type AddStatus = 'idle' | 'adding' | 'done' | 'error';
+
+/** Progress of "Add to YouTube" for the loaded playlist. */
+interface AddState {
+  status: AddStatus;
+  /** Videos sent so far in the current click, out of total. */
+  sent: number;
+  total: number;
+  playlistId?: string;
+  playlistUrl?: string;
+  channelTitle?: string;
+  /** Every video already in this transfer's YouTube playlist. */
+  addedVideoIds: string[];
+  error?: string;
 }
 
 interface Playlist {
@@ -49,7 +72,9 @@ interface Row {
 /* ------------------------------------------------------------------ */
 
 const STEP_MS = 550;
-const LINK_PATTERN = /(open\.spotify\.com\/playlist\/|spotify:playlist:)[A-Za-z0-9]+/;
+/** Videos per request when adding to YouTube; smaller batches mean smoother progress. */
+const ADD_BATCH = 10;
+const IDLE_ADD: AddState = { status: 'idle', sent: 0, total: 0, addedVideoIds: [] };
 const TRACK_LIMITS = [0, 5, 10];
 const NAV_ITEMS = ['Transfer', 'History', 'Match cache', 'Settings'];
 
@@ -111,7 +136,7 @@ function hashString(value: string): number {
   return hash;
 }
 
-/** Fake YouTube search. Swap this for the real matcher later. */
+/** Fake YouTube search for the made-up demo tracks. Real tracks use matchTrack. */
 function resolveMatch(track: Track): MatchResult {
   const h = hashString(track.title + track.artist);
   const bucket = h % 10;
@@ -196,6 +221,16 @@ export default function App() {
   const [trackLimit, setTrackLimit] = useState(0);
   const [filter, setFilter] = useState<Filter>('all');
   const [destination, setDestination] = useState(`${DEMO_PLAYLIST.name} (from Spotify)`);
+  const [connection, setConnection] = useState<Connection>('checking');
+  const [spotify, setSpotify] = useState<SpotifyStatus>({ connection: 'checking' });
+  const [matchError, setMatchError] = useState('');
+  // One ID per loaded playlist. The backend uses it to reuse the same YouTube
+  // playlist when you retry, instead of creating a duplicate.
+  const [transferId, setTransferId] = useState(newTransferId);
+  const [addState, setAddState] = useState<AddState>(IDLE_ADD);
+  const [includeReview, setIncludeReview] = useState(false);
+
+  const isDemo = playlist === DEMO_PLAYLIST;
 
   const queue = useMemo(
     () => (trackLimit > 0 ? playlist.tracks.slice(0, trackLimit) : playlist.tracks),
@@ -205,18 +240,111 @@ export default function App() {
   const finished = queue.length > 0 && cursor >= queue.length;
   const isRunning = phase === 'running' && !finished;
 
-  // Simulated transfer: resolve one track per tick. Stopping flips
-  // isRunning to false, and the cleanup cancels the pending tick.
+  // Check once on mount. Aborting keeps StrictMode's double run from racing.
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchConnection(controller.signal)
+      .then(setConnection)
+      .catch(() => {
+        /* aborted on unmount */
+      });
+    fetchSpotifyStatus(controller.signal)
+      .then(setSpotify)
+      .catch(() => {
+        /* aborted on unmount */
+      });
+    return () => controller.abort();
+  }, []);
+
+  // Matching: resolve one track per step. Demo tracks use the fake matcher;
+  // real tracks are searched on YouTube by the backend (search only, nothing
+  // is created). Stopping flips isRunning to false, and the cleanup cancels
+  // the pending step and any request in flight.
   useEffect(() => {
     if (!isRunning) return;
-    const timer = window.setTimeout(() => {
-      const track = queue[cursor];
-      if (!track) return;
-      setResults((prev) => ({ ...prev, [track.id]: resolveMatch(track) }));
-      setCursor((c) => c + 1);
-    }, STEP_MS);
-    return () => window.clearTimeout(timer);
-  }, [isRunning, cursor, queue]);
+    const track = queue[cursor];
+    if (!track) return;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(
+      async () => {
+        try {
+          const result = isDemo ? resolveMatch(track) : await matchTrack(track, controller.signal);
+          setResults((prev) => ({ ...prev, [track.id]: result }));
+          setCursor((c) => c + 1);
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          if (error instanceof ApiError && error.status === 401) setConnection('disconnected');
+          setMatchError(error instanceof Error ? error.message : 'Matching failed.');
+          setPhase('stopped');
+        }
+      },
+      isDemo ? STEP_MS : 0,
+    );
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [isRunning, cursor, queue, isDemo]);
+
+  // Matched videos to add, without repeats (two tracks can match one video).
+  const addableIds = useMemo(() => {
+    const ids = queue.flatMap((track) => {
+      const result = results[track.id];
+      const wanted = result?.outcome === 'matched' || (includeReview && result?.outcome === 'review');
+      return wanted && result.videoId ? [result.videoId] : [];
+    });
+    return [...new Set(ids)];
+  }, [queue, results, includeReview]);
+
+  const addedIds = useMemo(() => new Set(addState.addedVideoIds), [addState.addedVideoIds]);
+  const pendingIds = addableIds.filter((id) => !addedIds.has(id));
+
+  // The only place a YouTube playlist gets created: when you click the button.
+  // Sends small batches with the same transferId, so a retry after an error
+  // (or a second click) continues in the same playlist.
+  async function addToYouTube() {
+    if (isDemo || addState.status === 'adding' || pendingIds.length === 0) return;
+
+    const ids = pendingIds;
+    let progress: AddState = { ...addState, status: 'adding', sent: 0, total: ids.length, error: undefined };
+    setAddState(progress);
+
+    for (let i = 0; i < ids.length; i += ADD_BATCH) {
+      const batch = ids.slice(i, i + ADD_BATCH);
+      const result = await addVideosToPlaylist({
+        transferId,
+        playlistId: progress.playlistId,
+        title: destination.trim() || 'Untitled playlist',
+        description: `Transferred from “${playlist.name}” with SyncTune.`,
+        videoIds: batch,
+      });
+
+      progress = {
+        ...progress,
+        playlistId: result.playlistId ?? progress.playlistId,
+        playlistUrl: result.playlistUrl ?? progress.playlistUrl,
+        channelTitle: result.channelTitle ?? progress.channelTitle,
+        addedVideoIds: result.addedVideoIds ?? progress.addedVideoIds,
+      };
+
+      if (!result.ok) {
+        if (result.status === 401) setConnection('disconnected');
+        // Deleted on YouTube: forget it, so the next try makes a fresh playlist.
+        if (result.reason === 'playlistNotFound') {
+          progress = { ...progress, playlistId: undefined, playlistUrl: undefined, addedVideoIds: [] };
+        }
+        setAddState({ ...progress, status: 'error', error: result.error });
+        return;
+      }
+
+      progress = { ...progress, sent: Math.min(i + batch.length, ids.length) };
+      setAddState(progress);
+    }
+
+    setAddState({ ...progress, status: 'done' });
+  }
 
   const counts = useMemo<Counts>(() => {
     const next: Counts = { matched: 0, review: 0, missing: 0 };
@@ -236,16 +364,22 @@ export default function App() {
 
   const visibleRows = filter === 'all' ? rows : rows.filter((row) => row.status === filter);
 
+  // Clears match results only. The transfer (and its YouTube playlist) stays,
+  // so running again adds to the same playlist rather than making a new one.
   function resetTransfer() {
     setResults({});
     setCursor(0);
     setPhase('idle');
     setFilter('all');
+    setMatchError('');
   }
 
   function loadPlaylist(next: Playlist) {
     setPlaylist(next);
     setDestination(`${next.name} (from Spotify)`);
+    setTransferId(newTransferId());
+    setAddState(IDLE_ADD);
+    setIncludeReview(false);
     resetTransfer();
   }
 
@@ -255,6 +389,7 @@ export default function App() {
       setCursor(0);
       setFilter('all');
     }
+    setMatchError('');
     setPhase('running');
   }
 
@@ -272,7 +407,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <Sidebar />
+      <Sidebar youtube={connection} spotify={spotify.connection} />
 
       <main className="main">
         <header className="topbar">
@@ -280,10 +415,10 @@ export default function App() {
             <h1>Transfer a playlist</h1>
             <p className="topbar-sub">Bring a Spotify playlist over to YouTube, one track at a time.</p>
           </div>
-          <span className="demo-badge">Demo data</span>
+          {isDemo && <span className="demo-badge">Demo data</span>}
         </header>
 
-        <PlaylistInput onLoad={loadPlaylist} disabled={isRunning} />
+        <PlaylistInput onLoad={loadPlaylist} disabled={isRunning || addState.status === 'adding'} spotify={spotify} />
 
         <div className="workspace">
           <section className="panel tracks-panel" aria-labelledby="playlist-title">
@@ -304,7 +439,7 @@ export default function App() {
               ))}
             </div>
 
-            <TrackTable rows={visibleRows} filter={filter} />
+            <TrackTable rows={visibleRows} filter={filter} addedIds={addedIds} />
           </section>
 
           <TransferPanel
@@ -318,6 +453,14 @@ export default function App() {
             destination={destination}
             trackLimit={trackLimit}
             totalTracks={playlist.tracks.length}
+            isDemo={isDemo}
+            connection={connection}
+            matchError={matchError}
+            addState={addState}
+            pendingCount={pendingIds.length}
+            includeReview={includeReview}
+            onIncludeReviewChange={setIncludeReview}
+            onAdd={addToYouTube}
             onDestinationChange={setDestination}
             onLimitChange={changeLimit}
             onStart={startTransfer}
@@ -326,6 +469,8 @@ export default function App() {
             onShow={setFilter}
           />
         </div>
+
+        <YouTubeTestPanel />
       </main>
     </div>
   );
@@ -350,7 +495,19 @@ function Logo() {
   );
 }
 
-function Sidebar() {
+const CONNECTION_LABEL: Record<Connection, string> = {
+  checking: 'Checking…',
+  connected: 'Connected',
+  disconnected: 'Not connected',
+  unreachable: 'Offline',
+};
+
+const SPOTIFY_LABEL: Record<SpotifyConnection, string> = {
+  ...CONNECTION_LABEL,
+  'not-configured': 'Not set up',
+};
+
+function Sidebar({ youtube, spotify }: { youtube: Connection; spotify: SpotifyConnection }) {
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -390,14 +547,14 @@ function Sidebar() {
         <h2 className="sidebar-heading">Accounts</h2>
         <ul className="conn-list">
           <li className="conn">
-            <span className="conn-dot" aria-hidden="true" />
+            <span className={`conn-dot${spotify === 'connected' ? '' : ' conn-dot--off'}`} aria-hidden="true" />
             Spotify
-            <span className="conn-state">Demo</span>
+            <span className="conn-state">{SPOTIFY_LABEL[spotify]}</span>
           </li>
           <li className="conn">
-            <span className="conn-dot" aria-hidden="true" />
+            <span className={`conn-dot${youtube === 'connected' ? '' : ' conn-dot--off'}`} aria-hidden="true" />
             YouTube
-            <span className="conn-state">Demo</span>
+            <span className="conn-state">{CONNECTION_LABEL[youtube]}</span>
           </li>
         </ul>
       </div>
@@ -409,32 +566,100 @@ function Sidebar() {
 /* Playlist input                                                      */
 /* ------------------------------------------------------------------ */
 
-function PlaylistInput({ onLoad, disabled }: { onLoad: (playlist: Playlist) => void; disabled: boolean }) {
+const SPOTIFY_HINT: Record<SpotifyConnection, string> = {
+  checking: 'Checking your Spotify connection…',
+  connected: 'Spotify only lets SyncTune read playlists you own or collaborate on.',
+  disconnected: 'Connect Spotify to load your playlists. SyncTune only reads them; nothing changes on Spotify.',
+  'not-configured':
+    'Spotify import isn’t set up on the server yet (it needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in server/.env). Paste tracks still works.',
+  unreachable: 'Can’t reach the SyncTune backend, so Spotify can’t be checked.',
+};
+
+function describeSkipped({ episodes, unavailable }: { episodes: number; unavailable: number }): string {
+  const parts: string[] = [];
+  if (episodes > 0) parts.push(plural(episodes, 'podcast episode'));
+  if (unavailable > 0) parts.push(`${plural(unavailable, 'song')} Spotify no longer provides`);
+  return parts.length > 0 ? `skipped ${parts.join(' and ')}` : '';
+}
+
+interface PlaylistInputProps {
+  onLoad: (playlist: Playlist) => void;
+  disabled: boolean;
+  spotify: SpotifyStatus;
+}
+
+function PlaylistInput({ onLoad, disabled, spotify }: PlaylistInputProps) {
   const [mode, setMode] = useState<InputMode>('link');
-  const [link, setLink] = useState('https://open.spotify.com/playlist/37i9dQZF1DXdemo');
+  const [link, setLink] = useState('');
   const [pasted, setPasted] = useState('');
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [loading, setLoading] = useState(false);
+  const [myPlaylists, setMyPlaylists] = useState<SpotifyPlaylistSummary[] | null>(null);
+
+  const spotifyReady = spotify.connection === 'connected';
+
+  // Your own playlists to pick from, since those are the ones Spotify lets
+  // SyncTune read. Optional: the link field works without it.
+  useEffect(() => {
+    if (!spotifyReady) return;
+    const controller = new AbortController();
+    fetchMyPlaylists(controller.signal)
+      .then(setMyPlaylists)
+      .catch(() => {
+        /* aborted, or the list failed; pasting a link still works */
+      });
+    return () => controller.abort();
+  }, [spotifyReady]);
 
   function switchMode(next: InputMode) {
     setMode(next);
     setError('');
+    setNotice('');
+  }
+
+  // Reads the playlist's songs. Read-only: nothing is created on YouTube here.
+  async function loadFromSpotify() {
+    const id = parsePlaylistId(link);
+    if (!id) {
+      setError('That isn’t a Spotify playlist link. In Spotify, choose Share, then Copy link to playlist, and paste it here.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const imported = await importPlaylist(id);
+      const skipped = describeSkipped(imported.skipped);
+
+      if (imported.tracks.length === 0) {
+        setError(`“${imported.name}” has no songs to transfer${skipped ? ` (${skipped})` : ''}.`);
+        return;
+      }
+
+      onLoad({ name: imported.name, owner: imported.owner, tracks: imported.tracks });
+      setNotice(
+        `Loaded ${plural(imported.tracks.length, 'song')} from “${imported.name}”${skipped ? `; ${skipped}` : ''}. Nothing has been added to YouTube.`,
+      );
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : 'Couldn’t load that playlist.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function loadDemo() {
+    setError('');
+    onLoad(DEMO_PLAYLIST);
+    setNotice('Loaded the demo playlist. Its songs are made up.');
   }
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError('');
+    setNotice('');
 
     if (mode === 'link') {
-      if (!LINK_PATTERN.test(link.trim())) {
-        setError('That isn’t a Spotify playlist link. In Spotify, choose Share, then Copy link to playlist, and paste it here.');
-        return;
-      }
-      setLoading(true);
-      window.setTimeout(() => {
-        setLoading(false);
-        onLoad(DEMO_PLAYLIST);
-      }, 600);
+      void loadFromSpotify();
       return;
     }
 
@@ -447,6 +672,12 @@ function PlaylistInput({ onLoad, disabled }: { onLoad: (playlist: Playlist) => v
   }
 
   const busy = disabled || loading;
+  const selectedId = parsePlaylistId(link);
+  const pickable = myPlaylists
+    ? [...myPlaylists].sort(
+        (a, b) => Number(b.ownedByYou || b.collaborative) - Number(a.ownedByYou || a.collaborative),
+      )
+    : [];
 
   return (
     <form className="panel source" onSubmit={handleSubmit} aria-label="Choose a playlist">
@@ -460,26 +691,74 @@ function PlaylistInput({ onLoad, disabled }: { onLoad: (playlist: Playlist) => v
       </div>
 
       {mode === 'link' ? (
-        <div className="source-row">
-          <label className="visually-hidden" htmlFor="playlist-link">
-            Spotify playlist link
-          </label>
-          <input
-            id="playlist-link"
-            className="field"
-            type="url"
-            inputMode="url"
-            placeholder="https://open.spotify.com/playlist/…"
-            value={link}
-            onChange={(e) => setLink(e.target.value)}
-            disabled={busy}
-            aria-invalid={error ? true : undefined}
-            aria-describedby={error ? 'source-error' : undefined}
-          />
-          <button type="submit" className="btn btn-primary" disabled={busy}>
-            {loading ? 'Loading…' : 'Load playlist'}
-          </button>
-        </div>
+        <>
+          <div className="source-row">
+            <label className="visually-hidden" htmlFor="playlist-link">
+              Spotify playlist link
+            </label>
+            <input
+              id="playlist-link"
+              className="field"
+              type="url"
+              inputMode="url"
+              placeholder="https://open.spotify.com/playlist/…"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              disabled={busy}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={error ? 'source-error link-hint' : 'link-hint'}
+            />
+            {spotify.connection === 'disconnected' ? (
+              <a className="btn btn-primary" href={SPOTIFY_CONNECT_URL}>
+                Connect Spotify
+              </a>
+            ) : (
+              <button type="submit" className="btn btn-primary" disabled={busy || !spotifyReady || !link.trim()}>
+                {loading ? 'Loading…' : 'Load playlist'}
+              </button>
+            )}
+          </div>
+
+          {spotifyReady && pickable.length > 0 && (
+            <div className="source-row">
+              <label className="visually-hidden" htmlFor="my-playlists">
+                Your Spotify playlists
+              </label>
+              <select
+                id="my-playlists"
+                className="field"
+                value={pickable.some((p) => p.id === selectedId) ? (selectedId ?? '') : ''}
+                onChange={(e) => {
+                  if (!e.target.value) return;
+                  setLink(`https://open.spotify.com/playlist/${e.target.value}`);
+                  setError('');
+                }}
+                disabled={busy}
+              >
+                <option value="">Or pick one of your playlists…</option>
+                {pickable.map((p) => {
+                  const readable = p.ownedByYou || p.collaborative;
+                  const count = p.trackCount === null ? '' : ` (${plural(p.trackCount, 'song')})`;
+                  return (
+                    <option key={p.id} value={p.id} disabled={!readable}>
+                      {p.name}
+                      {count}
+                      {readable ? '' : ' – by someone else, can’t be read'}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
+
+          <p className="hint" id="link-hint">
+            {spotifyReady && spotify.displayName ? `Signed in to Spotify as ${spotify.displayName}. ` : ''}
+            {SPOTIFY_HINT[spotify.connection]}{' '}
+            <button type="button" className="btn-link" onClick={loadDemo} disabled={busy}>
+              Use the demo playlist
+            </button>
+          </p>
+        </>
       ) : (
         <div className="source-paste">
           <label className="visually-hidden" htmlFor="playlist-paste">
@@ -509,6 +788,12 @@ function PlaylistInput({ onLoad, disabled }: { onLoad: (playlist: Playlist) => v
       {error && (
         <p className="error" id="source-error" role="alert">
           {error}
+        </p>
+      )}
+
+      {notice && !error && (
+        <p className="source-notice" role="status">
+          {notice}
         </p>
       )}
     </form>
@@ -546,7 +831,7 @@ function PlaylistHeader({ playlist, queueLength }: { playlist: Playlist; queueLe
   );
 }
 
-function TrackTable({ rows, filter }: { rows: Row[]; filter: Filter }) {
+function TrackTable({ rows, filter, addedIds }: { rows: Row[]; filter: Filter; addedIds: Set<string> }) {
   return (
     <div className="table-wrap">
       <table className="tracks">
@@ -585,7 +870,7 @@ function TrackTable({ rows, filter }: { rows: Row[]; filter: Filter }) {
                 <td className="col-album">{row.track.album || '—'}</td>
                 <td className="col-time">{formatDuration(row.track.durationSec)}</td>
                 <td>
-                  <MatchCell row={row} />
+                  <MatchCell row={row} added={Boolean(row.result?.videoId && addedIds.has(row.result.videoId))} />
                 </td>
               </tr>
             ))
@@ -596,7 +881,7 @@ function TrackTable({ rows, filter }: { rows: Row[]; filter: Filter }) {
   );
 }
 
-function MatchCell({ row }: { row: Row }) {
+function MatchCell({ row, added }: { row: Row; added: boolean }) {
   const { status, result } = row;
 
   if (status === 'waiting') return <span className="muted">Waiting</span>;
@@ -622,8 +907,16 @@ function MatchCell({ row }: { row: Row }) {
             {result.videoTitle}
           </span>
           <span className="match-meta">
-            {result.channel}, {result.confidence}% match
+            {result.videoId ? (
+              <a href={`https://www.youtube.com/watch?v=${result.videoId}`} target="_blank" rel="noreferrer">
+                {result.channel}
+              </a>
+            ) : (
+              result.channel
+            )}
+            , {result.confidence}% match
           </span>
+          {added && <span className="match-meta match-added">Added to your YouTube playlist</span>}
         </>
       )}
     </div>
@@ -645,6 +938,15 @@ interface TransferPanelProps {
   destination: string;
   trackLimit: number;
   totalTracks: number;
+  isDemo: boolean;
+  connection: Connection;
+  matchError: string;
+  addState: AddState;
+  /** Matched videos not yet in the YouTube playlist. */
+  pendingCount: number;
+  includeReview: boolean;
+  onIncludeReviewChange: (value: boolean) => void;
+  onAdd: () => void;
   onDestinationChange: (value: string) => void;
   onLimitChange: (limit: number) => void;
   onStart: () => void;
@@ -664,6 +966,14 @@ function TransferPanel({
   destination,
   trackLimit,
   totalTracks,
+  isDemo,
+  connection,
+  matchError,
+  addState,
+  pendingCount,
+  includeReview,
+  onIncludeReviewChange,
+  onAdd,
   onDestinationChange,
   onLimitChange,
   onStart,
@@ -675,17 +985,33 @@ function TransferPanel({
   const paused = phase === 'stopped' && cursor > 0 && !finished;
   const current = isRunning ? queue[cursor] : undefined;
   const destName = destination.trim() || 'Untitled playlist';
+  const needsYouTube = !isDemo && connection !== 'connected';
+  const adding = addState.status === 'adding';
+  const addedCount = addState.addedVideoIds.length;
+  // Once the playlist exists its name is fixed; renaming here wouldn't rename it.
+  const playlistExists = Boolean(addState.playlistUrl);
 
   let status: string;
   if (current) {
     status = `Searching YouTube for “${current.title}” by ${current.artist}.`;
   } else if (finished) {
-    status = `Added ${plural(counts.matched, 'track')} to “${destName}”.`;
+    status = `Checked ${plural(queue.length, 'track')}: ${counts.matched} matched, ${counts.review} need review, ${counts.missing} not found.`;
   } else if (paused) {
     status = `Stopped after ${cursor} of ${queue.length} tracks. Resume to pick up where you left off.`;
+  } else if (isDemo) {
+    status = `${plural(queue.length, 'track')} ready. These are made-up demo songs, so matching is simulated.`;
+  } else if (needsYouTube) {
+    status = 'Connect YouTube to search for these tracks.';
   } else {
-    status = `${plural(queue.length, 'track')} ready. Matches go into a new YouTube playlist.`;
+    status = `${plural(queue.length, 'track')} ready. Searching doesn’t change anything on YouTube; you choose what to add afterwards.`;
   }
+
+  let addLabel: string;
+  if (adding) addLabel = `Adding ${addState.sent} of ${addState.total}…`;
+  else if (addState.status === 'error' && playlistExists) addLabel = `Retry: add ${plural(pendingCount, 'remaining track')}`;
+  else if (addedCount > 0 && pendingCount === 0) addLabel = 'All selected matches added';
+  else if (addedCount > 0) addLabel = `Add ${plural(pendingCount, 'more track')} to the same playlist`;
+  else addLabel = `Create playlist with ${plural(pendingCount, 'track')}`;
 
   return (
     <aside className="panel transfer" aria-labelledby="transfer-heading">
@@ -704,7 +1030,7 @@ function TransferPanel({
             className="field"
             value={destination}
             onChange={(e) => onDestinationChange(e.target.value)}
-            disabled={isRunning}
+            disabled={isRunning || adding || playlistExists}
           />
         </div>
         <div>
@@ -793,26 +1119,94 @@ function TransferPanel({
         </div>
       )}
 
+      {matchError && (
+        <p className="error" role="alert">
+          {matchError} Tracks already checked are kept.
+        </p>
+      )}
+
+      {/* Step 2: nothing is created on YouTube until this button is clicked. */}
+      {finished && !isDemo && (
+        <div className="add-step">
+          {counts.review > 0 && (
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={includeReview}
+                onChange={(e) => onIncludeReviewChange(e.target.checked)}
+                disabled={adding}
+              />
+              Also add the {plural(counts.review, 'track')} marked “Needs review”
+            </label>
+          )}
+
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={onAdd}
+            disabled={adding || pendingCount === 0 || needsYouTube}
+          >
+            {addLabel}
+          </button>
+
+          {addState.playlistUrl && (
+            <p className="add-result" role="status">
+              {addedCount > 0
+                ? `${plural(addedCount, 'track')} in your private playlist “${destName}”`
+                : `Created your private playlist “${destName}”`}
+              {addState.channelTitle ? ` on the channel “${addState.channelTitle}”` : ''}.{' '}
+              <a href={addState.playlistUrl} target="_blank" rel="noreferrer">
+                Open on YouTube
+              </a>
+            </p>
+          )}
+
+          {addState.status === 'error' && (
+            <p className="error" role="alert">
+              {addState.error}
+              {playlistExists && ' Retrying continues in the same playlist.'}
+            </p>
+          )}
+        </div>
+      )}
+
+      {finished && isDemo && (
+        <p className="hint">Demo songs are made up, so there’s nothing to add to YouTube. Choose Paste tracks to transfer real songs.</p>
+      )}
+
       <div className="actions">
-        {isRunning ? (
+        {needsYouTube && !isRunning ? (
+          <a className="btn btn-primary" href={CONNECT_URL}>
+            Connect YouTube
+          </a>
+        ) : isRunning ? (
           <button type="button" className="btn btn-stop" onClick={onStop}>
-            Stop transfer
+            Stop matching
           </button>
         ) : paused ? (
           <>
             <button type="button" className="btn btn-primary" onClick={onStart}>
-              Resume transfer
+              Resume matching
             </button>
             <button type="button" className="btn btn-ghost" onClick={onReset}>
               Start over
             </button>
           </>
         ) : (
-          <button type="button" className="btn btn-primary" onClick={onStart} disabled={queue.length === 0}>
-            {finished ? 'Run again' : 'Start transfer'}
+          <button
+            type="button"
+            className={`btn ${finished && !isDemo ? 'btn-ghost' : 'btn-primary'}`}
+            onClick={onStart}
+            disabled={queue.length === 0 || adding}
+          >
+            {finished ? 'Match again' : 'Find YouTube matches'}
           </button>
         )}
       </div>
+
+      {!isDemo && !finished && !needsYouTube && (
+        <p className="hint">Each new song search uses about 1% of SyncTune’s daily YouTube quota. Repeat searches are free.</p>
+      )}
     </aside>
   );
 }

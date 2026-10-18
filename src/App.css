@@ -162,6 +162,10 @@
   background: var(--green);
 }
 
+.conn-dot--off {
+  background: var(--text-faint);
+}
+
 .conn-state {
   margin-left: auto;
   font-size: 0.8rem;
@@ -350,6 +354,15 @@ select.field {
   display: grid;
   gap: 12px;
   padding: 16px;
+}
+
+.source-notice {
+  font-size: 0.88rem;
+  color: var(--green);
+}
+
+.hint .btn-link {
+  font-size: inherit;
 }
 
 .segmented {
@@ -601,6 +614,15 @@ select.field {
   color: var(--text-muted);
 }
 
+.match-meta a {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+.match-added {
+  color: var(--green);
+}
+
 .pill {
   display: inline-flex;
   align-items: center;
@@ -822,6 +844,41 @@ select.field {
   margin-top: -6px;
 }
 
+/* Step 2 of a transfer: adding matches to YouTube */
+
+.add-step {
+  display: grid;
+  gap: 10px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+.check input {
+  accent-color: var(--green);
+}
+
+.add-result {
+  font-size: 0.9rem;
+  color: var(--green);
+  overflow-wrap: anywhere;
+}
+
+.add-result a {
+  font-weight: 600;
+  color: inherit;
+  text-underline-offset: 3px;
+}
+
+.actions a.btn {
+  text-decoration: none;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -830,6 +887,55 @@ select.field {
 
 .actions .btn {
   flex: 1;
+}
+
+/* ================================================================ */
+/* YouTube integration test                                          */
+/* ================================================================ */
+
+.yt-test {
+  display: grid;
+  gap: 16px;
+  padding: 20px;
+}
+
+.yt-test-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.yt-test h2 {
+  margin-bottom: 4px;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.yt-test-head .pill {
+  flex-shrink: 0;
+}
+
+.yt-test-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.yt-test-actions a.btn {
+  text-decoration: none;
+}
+
+.yt-test-success {
+  font-size: 0.9rem;
+  color: var(--green);
+  overflow-wrap: anywhere;
+}
+
+.yt-test-success a {
+  font-weight: 600;
+  color: inherit;
+  text-underline-offset: 3px;
 }
 
 /* ================================================================ */
