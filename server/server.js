@@ -21,7 +21,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 // `npm start`); in production they must be set (see DEPLOYMENT.md).
 const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
 const REDIRECT_URI =
-  process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/oauth2/callback`;
+  process.env.GOOGLE_REDIRECT_URI || "https://synctune-30vx.onrender.com/oauth2/callback";
 
 if (
   !process.env.GOOGLE_CLIENT_ID ||
@@ -215,12 +215,17 @@ app.use((req, res, next) => {
 });
 
 if (IS_PRODUCTION) {
+  // Only requests that came through a proxy (X-Forwarded-Proto set) matter:
+  // Render's own health checks reach the app over plain HTTP without it.
   let warned = false;
   app.use((req, _res, next) => {
-    if (!req.secure && !warned) {
+    const forwardedProto = req.get("x-forwarded-proto");
+    if (!req.secure && forwardedProto && !warned) {
       warned = true;
       console.warn(
-        "A request did not arrive over HTTPS (or the proxy isn't trusted), so the secure session cookie won't be set. Check TRUST_PROXY."
+        "A proxied request was not seen as HTTPS, so the secure session cookie won't be set. Check TRUST_PROXY.",
+        // Path only, never the query string (OAuth callbacks carry codes there).
+        { path: req.path, forwardedProto }
       );
     }
     next();
