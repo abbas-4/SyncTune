@@ -15,8 +15,13 @@ require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const FRONTEND_URL = "http://localhost:5173";
-const REDIRECT_URI = `http://localhost:${PORT}/oauth2/callback`;
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+
+// Public URLs. The defaults match local development (`npm run dev` and
+// `npm start`); in production they must be set (see DEPLOYMENT.md).
+const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
+const REDIRECT_URI =
+  process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/oauth2/callback`;
 
 if (
   !process.env.GOOGLE_CLIENT_ID ||
@@ -27,6 +32,27 @@ if (
     "Missing GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, or SESSION_SECRET in server/.env"
   );
 }
+
+if (IS_PRODUCTION) {
+  for (const [name, value] of [
+    ["FRONTEND_URL", process.env.FRONTEND_URL],
+    ["GOOGLE_REDIRECT_URI", process.env.GOOGLE_REDIRECT_URI],
+  ]) {
+    if (!value || !value.startsWith("https://")) {
+      throw new Error(`${name} must be set to an https:// URL when NODE_ENV=production.`);
+    }
+  }
+}
+
+const FRONTEND_ORIGIN = new URL(FRONTEND_URL).origin;
+// The origin the browser uses to reach this API: the Google callback lives on it.
+const API_ORIGIN = new URL(REDIRECT_URI).origin;
+
+// When the frontend and API are on different sites (e.g. vercel.app calling
+// onrender.com directly), the browser only sends the session cookie on the
+// frontend's requests if it's SameSite=None, which requires Secure (HTTPS).
+// Behind a same-origin proxy (Vercel rewrites) the cookie is first-party: Lax.
+const CROSS_SITE_COOKIE = IS_PRODUCTION && FRONTEND_ORIGIN !== API_ORIGIN;
 
 function createOAuthClient() {
   return new google.auth.OAuth2(
@@ -154,12 +180,52 @@ async function withTransientRetry(label, call) {
   }
 }
 
+if (IS_PRODUCTION) {
+  // Render terminates HTTPS at its proxy and forwards plain HTTP. Trusting that
+  // one hop lets Express see the original https scheme, which secure cookies
+  // need. Override with TRUST_PROXY if more proxies sit in front.
+  app.set("trust proxy", Number(process.env.TRUST_PROXY ?? 1));
+}
+
 app.use(
   cors({
-    origin: FRONTEND_URL,
+    origin: FRONTEND_ORIGIN,
     credentials: true,
   })
 );
+
+// Every response here is per-user and must never be cached by a CDN or proxy
+// (Vercel rewrites honor upstream cache headers).
+app.use((_req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+
+// With a SameSite=None cookie, the browser attaches the session to requests
+// from any site, so refuse state-changing requests from other origins.
+// Browsers always send Origin on these; requests without it (curl, scripts)
+// don't carry a browser's cookie.
+app.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const origin = req.get("origin");
+  if (origin && origin !== FRONTEND_ORIGIN) {
+    return res.status(403).json({ error: "Request from an unexpected origin." });
+  }
+  next();
+});
+
+if (IS_PRODUCTION) {
+  let warned = false;
+  app.use((req, _res, next) => {
+    if (!req.secure && !warned) {
+      warned = true;
+      console.warn(
+        "A request did not arrive over HTTPS (or the proxy isn't trusted), so the secure session cookie won't be set. Check TRUST_PROXY."
+      );
+    }
+    next();
+  });
+}
 
 app.use(express.json());
 
@@ -171,8 +237,9 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: "lax",
-      secure: false, // Local development only; use HTTPS in production.
+      // Production is HTTPS only; local development runs on plain http.
+      secure: IS_PRODUCTION,
+      sameSite: CROSS_SITE_COOKIE ? "none" : "lax",
       maxAge: 60 * 60 * 1000,
     },
   })
@@ -617,9 +684,21 @@ async function listPlaylistVideoIds(youtube, playlistId) {
 registerSpotifyRoutes(app, {
   port: PORT,
   frontendUrl: FRONTEND_URL,
+  isProduction: IS_PRODUCTION,
   saveSessionQuietly,
 });
 
 app.listen(PORT, () => {
-  console.log(`SyncTune server running at http://localhost:${PORT}`);
+  console.log(
+    IS_PRODUCTION
+      ? `SyncTune server running on port ${PORT}`
+      : `SyncTune server running at http://localhost:${PORT}`
+  );
+  // Public settings only; never secrets.
+  console.log("Config:", {
+    mode: IS_PRODUCTION ? "production" : "development",
+    frontendUrl: FRONTEND_URL,
+    googleRedirectUri: REDIRECT_URI,
+    sessionCookie: `${IS_PRODUCTION ? "Secure; " : ""}SameSite=${CROSS_SITE_COOKIE ? "None" : "Lax"}`,
+  });
 });

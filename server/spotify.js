@@ -6,7 +6,9 @@
 // - Redirect URIs can't use "localhost"; a local one must use 127.0.0.1. The
 //   dashboard talks to the API on localhost, and browsers keep separate cookies
 //   for the two, so the callback arrives without the SyncTune session. It is
-//   bridged with a one-time handoff (see /auth/spotify/complete).
+//   bridged with a one-time handoff (see /auth/spotify/complete). In
+//   production the callback is on the same origin as the session, and the
+//   handoff simply continues there.
 // - Development Mode apps can only read the songs of playlists the signed-in
 //   user owns or collaborates on (since Feb 2026). Others return 403.
 // - Playlist songs come from /playlists/{id}/items, and each entry's song is
@@ -81,18 +83,28 @@ function toTracks(entries, startIndex = 0) {
   return { tracks, episodes, unavailable };
 }
 
-function registerSpotifyRoutes(app, { port, frontendUrl, saveSessionQuietly }) {
+function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessionQuietly }) {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
-  const configured = Boolean(clientId && clientSecret);
   const redirectUri =
-    process.env.SPOTIFY_REDIRECT_URI || `http://127.0.0.1:${port}/auth/spotify/callback`;
-  // Where the dashboard's session cookie lives (it calls the API on localhost).
-  const apiOrigin = `http://localhost:${port}`;
+    process.env.SPOTIFY_REDIRECT_URI ||
+    (isProduction ? "" : `http://127.0.0.1:${port}/auth/spotify/callback`);
+  const configured = Boolean(clientId && clientSecret && redirectUri.startsWith(isProduction ? "https://" : "http"));
+
+  // Where to finish sign-in: back on the origin that holds the dashboard's
+  // session cookie. Locally that's localhost (the callback had to use
+  // 127.0.0.1); in production the callback already is on that origin, so a
+  // relative URL keeps it there, including behind a Vercel rewrite.
+  const callbackHost = redirectUri ? new URL(redirectUri).hostname : "";
+  const completePath = ["127.0.0.1", "[::1]"].includes(callbackHost)
+    ? `http://localhost:${port}/auth/spotify/complete`
+    : "/auth/spotify/complete";
 
   if (!configured) {
     console.log(
-      "Spotify import is off: add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to server/.env to turn it on."
+      clientId && clientSecret
+        ? "Spotify import is off: SPOTIFY_REDIRECT_URI must be set to an https:// URL in production."
+        : "Spotify import is off: add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to server/.env to turn it on."
     );
   }
 
@@ -227,7 +239,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, saveSessionQuietly }) {
     res.status(status).json({ error: friendlyMessage(error, context), reason: error.reason });
   }
 
-  // 1. Start sign-in (on localhost, with the dashboard's session cookie).
+  // 1. Start sign-in (on the API origin, with the dashboard's session cookie).
   app.get("/auth/spotify", (req, res) => {
     if (!configured) {
       return res
@@ -258,9 +270,10 @@ function registerSpotifyRoutes(app, { port, frontendUrl, saveSessionQuietly }) {
     });
   });
 
-  // 2. Spotify sends the browser here, on 127.0.0.1, without the SyncTune
-  // session. Exchange the code here, park the tokens under the one-time
-  // state, and hand back to localhost.
+  // 2. Spotify sends the browser to the redirect URI. Locally that's 127.0.0.1,
+  // which has no SyncTune session, so nothing here relies on the cookie:
+  // exchange the code, park the tokens under the one-time state, and hand back
+  // to the session's origin (completePath).
   app.get("/auth/spotify/callback", async (req, res) => {
     const { state, code, error } = req.query;
     const login = typeof state === "string" ? pendingLogins.get(state) : undefined;
@@ -300,7 +313,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, saveSessionQuietly }) {
         hasRefreshToken: Boolean(tokens.refresh_token),
       });
 
-      res.redirect(`${apiOrigin}/auth/spotify/complete?state=${encodeURIComponent(state)}`);
+      res.redirect(`${completePath}?state=${encodeURIComponent(state)}`);
     } catch (callbackError) {
       pendingLogins.delete(state);
       logFailure("Spotify sign-in failed:", callbackError, { step: "callback" });
@@ -308,8 +321,8 @@ function registerSpotifyRoutes(app, { port, frontendUrl, saveSessionQuietly }) {
     }
   });
 
-  // 3. Back on localhost with the session that started the sign-in. Only that
-  // session (whose saved state matches) can claim the parked tokens.
+  // 3. Back with the session that started the sign-in. Only that session
+  // (whose saved state matches) can claim the parked tokens.
   app.get("/auth/spotify/complete", (req, res) => {
     const { state } = req.query;
     const login = typeof state === "string" ? pendingLogins.get(state) : undefined;

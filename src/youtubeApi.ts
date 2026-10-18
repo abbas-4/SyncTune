@@ -4,7 +4,9 @@
 /* talks to our own backend, using the session cookie.                 */
 /* ------------------------------------------------------------------ */
 
-export const API_BASE_URL: string = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:3001';
+// Set VITE_API_BASE_URL at build time for production (it's a public URL, not a
+// secret). Local development falls back to the backend on port 3001.
+export const API_BASE_URL: string = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001').replace(/\/+$/, '');
 export const CONNECT_URL = `${API_BASE_URL}/auth/youtube`;
 
 export type Connection = 'checking' | 'connected' | 'disconnected' | 'unreachable';

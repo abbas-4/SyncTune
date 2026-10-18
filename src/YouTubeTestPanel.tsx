@@ -150,8 +150,8 @@ export default function YouTubeTestPanel() {
 
       {connection === 'unreachable' && (
         <p className="error" role="alert">
-          Couldn’t reach the SyncTune backend at {API_BASE_URL}. Start it with <code>npm start</code> in the server
-          folder, then check again.
+          Couldn’t reach the SyncTune backend at {API_BASE_URL}. Make sure it’s running (locally:{' '}
+          <code>npm start</code> in the server folder), then check again.
         </p>
       )}
 

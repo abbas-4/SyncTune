@@ -161,6 +161,10 @@ Run these from the project root:
 | `npm run preview` | Preview the production build |
 | `npm run lint` | Run ESLint |
 
+### Deploying
+
+To host SyncTune (frontend on Vercel, backend on Render), follow [DEPLOYMENT.md](DEPLOYMENT.md). It lists the exact settings, environment variables and OAuth redirect URIs.
+
 ## Environment variables
 
 All secrets live in `server/.env`, which is ignored by git. Never put them in the frontend or in a variable that starts with `VITE_`, because Vite includes those in the code sent to the browser.
@@ -193,8 +197,12 @@ SPOTIFY_CLIENT_SECRET=your-spotify-client-secret
 | `SPOTIFY_CLIENT_ID` | For Spotify | From the Spotify Developer Dashboard |
 | `SPOTIFY_CLIENT_SECRET` | For Spotify | From the Spotify Developer Dashboard |
 | `SPOTIFY_REDIRECT_URI` | No | Only if you registered a different redirect URI. Defaults to `http://127.0.0.1:<PORT>/auth/spotify/callback`. |
+| `FRONTEND_URL` | Production | Where the dashboard runs. Defaults to `http://localhost:5173`. |
+| `GOOGLE_REDIRECT_URI` | Production | Defaults to `http://localhost:<PORT>/oauth2/callback`. |
+| `NODE_ENV` | Production | Set to `production` when deployed: enables secure cookies and the proxy settings. |
+| `TRUST_PROXY` | No | Production only. Number of proxies in front of the server, default `1`. |
 
-The server refuses to start without the three required Google/session variables. Without the Spotify variables it still runs, and the dashboard shows Spotify as "Not set up".
+The server refuses to start without the three required Google/session variables. Without the Spotify variables it still runs, and the dashboard shows Spotify as "Not set up". Locally you don't need any of the production variables; see [DEPLOYMENT.md](DEPLOYMENT.md) for their deployed values.
 
 **Frontend (optional), `.env.local` in the project root:**
 
@@ -265,8 +273,7 @@ SyncTune/
 
 - **Spotify only shares songs from your own playlists.** Under Spotify's Development Mode rules, an app can read the songs of playlists you **own or collaborate on**. Playlists by other people return an error, and Spotify-made playlists (Discover Weekly, editorial mixes) can't be read by apps. Workaround: copy the songs into a playlist of your own in Spotify, then import that.
 - **Spotify Development Mode limits.** The app owner needs Spotify Premium, and only a few users (added under User Management) can sign in.
-- **Local development only.** URLs are set up for `localhost`, sessions are stored in server memory with an insecure (HTTP) cookie, and there is no production deployment configuration.
-- **Restarting the backend signs you out.** Sessions, in-progress transfers and the match cache live in memory.
+- **Sessions live in server memory.** Sessions, in-progress transfers and the match cache are lost whenever the backend restarts (locally, or when a free host spins down), which signs everyone out. See [DEPLOYMENT.md](DEPLOYMENT.md#limitations-of-the-free-setup) for the other limits of a free deployment.
 - **YouTube quota.** The default daily quota covers only a few transfers of 20 or so songs.
 - **Matching isn't perfect.** Songs marked "Needs review" deserve a quick look, and the same video can match two different songs.
 - **One direction only.** Transfers go from Spotify (or pasted text) to YouTube.
@@ -284,7 +291,6 @@ These are **planned ideas, not finished features**:
 - Working History, Match cache and Settings pages
 - Automated tests (unit tests for matching, API tests with mocked Spotify/YouTube) and CI
 - More platforms and directions (for example YouTube → Spotify, Apple Music)
-- Production deployment with HTTPS and configurable URLs
 
 ## Contributing
 
