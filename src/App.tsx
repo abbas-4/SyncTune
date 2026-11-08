@@ -1,7 +1,17 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import './App.css';
+import HistoryPage from './HistoryPage';
+import Link from './Link';
+import MatchCachePage from './MatchCachePage';
+import SettingsPage from './SettingsPage';
 import YouTubeTestPanel from './YouTubeTestPanel';
+import { CONNECTION_LABEL, OUTCOME_LABEL, SPOTIFY_LABEL, formatDuration, plural } from './format';
+import { ROUTES, pathFor, replacePath, routeFromPath, usePathname } from './router';
+import type { Route } from './router';
+import { TRACK_LIMITS, getSettings } from './settings';
+import { saveTransfer, transferAnchor, useTransferHistory } from './transferHistory';
+import type { HistoryTrack } from './transferHistory';
 import {
   ApiError,
   CONNECT_URL,
@@ -75,14 +85,6 @@ const STEP_MS = 550;
 /** Videos per request when adding to YouTube; smaller batches mean smoother progress. */
 const ADD_BATCH = 10;
 const IDLE_ADD: AddState = { status: 'idle', sent: 0, total: 0, addedVideoIds: [] };
-const TRACK_LIMITS = [0, 5, 10];
-const NAV_ITEMS = ['Transfer', 'History', 'Match cache', 'Settings'];
-
-const OUTCOME_LABEL: Record<Outcome, string> = {
-  matched: 'Matched',
-  review: 'Needs review',
-  missing: 'Not found',
-};
 
 function demoTrack(
   n: number,
@@ -117,12 +119,6 @@ const DEMO_PLAYLIST: Playlist = {
     demoTrack(16, 'Echo Without a Room', 'Pale Arcade', 'Rooms', 274, 'matched'),
   ],
 };
-
-const RECENT_TRANSFERS = [
-  { name: 'Gym rotation', summary: '42 of 44 matched' },
-  { name: 'Study focus', summary: '31 of 31 matched' },
-  { name: 'Road trip 2026', summary: '58 of 63 matched' },
-];
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -162,13 +158,6 @@ function resolveMatch(track: Track): MatchResult {
   };
 }
 
-function formatDuration(totalSec: number): string {
-  if (totalSec <= 0) return '—';
-  const minutes = Math.floor(totalSec / 60);
-  const seconds = String(totalSec % 60).padStart(2, '0');
-  return `${minutes}:${seconds}`;
-}
-
 function formatTotal(tracks: Track[]): string {
   const totalSec = tracks.reduce((sum, track) => sum + track.durationSec, 0);
   if (totalSec === 0) return '';
@@ -205,10 +194,6 @@ function parsePasted(text: string): Track[] {
     });
 }
 
-function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? '' : 's'}`;
-}
-
 /* ------------------------------------------------------------------ */
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
@@ -218,7 +203,7 @@ export default function App() {
   const [results, setResults] = useState<Record<string, MatchResult>>({});
   const [phase, setPhase] = useState<Phase>('idle');
   const [cursor, setCursor] = useState(0);
-  const [trackLimit, setTrackLimit] = useState(0);
+  const [trackLimit, setTrackLimit] = useState(() => getSettings().defaultTrackLimit);
   const [filter, setFilter] = useState<Filter>('all');
   const [destination, setDestination] = useState(`${DEMO_PLAYLIST.name} (from Spotify)`);
   const [connection, setConnection] = useState<Connection>('checking');
@@ -228,7 +213,13 @@ export default function App() {
   // playlist when you retry, instead of creating a duplicate.
   const [transferId, setTransferId] = useState(newTransferId);
   const [addState, setAddState] = useState<AddState>(IDLE_ADD);
-  const [includeReview, setIncludeReview] = useState(false);
+  const [includeReview, setIncludeReview] = useState(() => getSettings().includeReviewByDefault);
+
+  const pathname = usePathname();
+  const matchedRoute = routeFromPath(pathname);
+  const route: Route = matchedRoute ?? 'transfer';
+  const mainRef = useRef<HTMLElement>(null);
+  const previousRoute = useRef(route);
 
   const isDemo = playlist === DEMO_PLAYLIST;
 
@@ -255,6 +246,32 @@ export default function App() {
       });
     return () => controller.abort();
   }, []);
+
+  // "Check connections" on the Settings page.
+  async function refreshConnections() {
+    setConnection('checking');
+    setSpotify({ connection: 'checking' });
+    const [youtube, spotifyStatus] = await Promise.all([fetchConnection(), fetchSpotifyStatus()]);
+    setConnection(youtube);
+    setSpotify(spotifyStatus);
+  }
+
+  // An unknown path shows the Transfer page; fix the address bar to match.
+  useEffect(() => {
+    if (matchedRoute === null) replacePath(`/${window.location.search}`);
+  }, [matchedRoute]);
+
+  useEffect(() => {
+    document.title = ROUTES.find((info) => info.id === route)?.title ?? 'SyncTune';
+  }, [route]);
+
+  // After switching pages, move focus to the new page's heading so keyboard
+  // and screen reader users start there. Not on first load.
+  useEffect(() => {
+    if (previousRoute.current === route) return;
+    previousRoute.current = route;
+    mainRef.current?.querySelector<HTMLElement>('.page:not([hidden]) h1')?.focus({ preventScroll: true });
+  }, [route]);
 
   // Matching: resolve one track per step. Demo tracks use the fake matcher;
   // real tracks are searched on YouTube by the backend (search only, nothing
@@ -379,7 +396,7 @@ export default function App() {
     setDestination(`${next.name} (from Spotify)`);
     setTransferId(newTransferId());
     setAddState(IDLE_ADD);
-    setIncludeReview(false);
+    setIncludeReview(getSettings().includeReviewByDefault);
     resetTransfer();
   }
 
@@ -398,6 +415,52 @@ export default function App() {
     resetTransfer();
   }
 
+  // Save real (non-demo) transfers to History once matching pauses or ends and
+  // whenever adding to YouTube finishes or fails. Skipped while matching or
+  // adding is in progress, and when nothing has been checked (e.g. right after
+  // "Start over"), so the last saved results aren't wiped.
+  const youtubeTitle = addState.playlistUrl ? destination.trim() || 'Untitled playlist' : undefined;
+  useEffect(() => {
+    if (isDemo || isRunning || addState.status === 'adding' || cursor === 0) return;
+
+    const added = new Set(addState.addedVideoIds);
+    const tracks: HistoryTrack[] = queue.map((track) => {
+      const result = results[track.id];
+      if (!result) return { title: track.title, artist: track.artist };
+      return {
+        title: track.title,
+        artist: track.artist,
+        outcome: result.outcome,
+        videoId: result.videoId,
+        videoTitle: result.videoTitle,
+        channel: result.channel,
+        confidence: result.confidence,
+        added: Boolean(result.videoId && added.has(result.videoId)),
+      };
+    });
+    const trackCounts: Counts = { matched: 0, review: 0, missing: 0 };
+    for (const track of tracks) if (track.outcome) trackCounts[track.outcome] += 1;
+
+    saveTransfer({
+      id: transferId,
+      playlistName: playlist.name,
+      source: playlist.owner,
+      checked: Math.min(cursor, queue.length),
+      counts: trackCounts,
+      tracks,
+      youtube:
+        addState.playlistUrl && youtubeTitle
+          ? {
+              playlistUrl: addState.playlistUrl,
+              title: youtubeTitle,
+              channelTitle: addState.channelTitle,
+              addedCount: addState.addedVideoIds.length,
+            }
+          : undefined,
+      addError: addState.status === 'error' ? addState.error : undefined,
+    });
+  }, [isDemo, isRunning, cursor, queue, results, transferId, playlist, addState, youtubeTitle]);
+
   const filterOptions: { id: Filter; label: string; count: number }[] = [
     { id: 'all', label: 'All', count: playlist.tracks.length },
     { id: 'matched', label: OUTCOME_LABEL.matched, count: counts.matched },
@@ -407,70 +470,95 @@ export default function App() {
 
   return (
     <div className="app">
-      <Sidebar youtube={connection} spotify={spotify.connection} />
+      <Sidebar
+        route={route}
+        youtube={connection}
+        spotify={spotify.connection}
+        transferBusy={isRunning || addState.status === 'adding'}
+      />
 
-      <main className="main">
-        <header className="topbar">
-          <div>
-            <h1>Transfer a playlist</h1>
-            <p className="topbar-sub">Bring a Spotify playlist over to YouTube, one track at a time.</p>
-          </div>
-          {isDemo && <span className="demo-badge">Demo data</span>}
-        </header>
-
-        <PlaylistInput onLoad={loadPlaylist} disabled={isRunning || addState.status === 'adding'} spotify={spotify} />
-
-        <div className="workspace">
-          <section className="panel tracks-panel" aria-labelledby="playlist-title">
-            <PlaylistHeader playlist={playlist} queueLength={queue.length} />
-
-            <div className="filters" role="group" aria-label="Filter tracks by match result">
-              {filterOptions.map((option) => (
-                <button
-                  key={option.id}
-                  type="button"
-                  className="chip"
-                  aria-pressed={filter === option.id}
-                  onClick={() => setFilter(option.id)}
-                >
-                  {option.label}
-                  <span className="chip-count">{option.count}</span>
-                </button>
-              ))}
+      <main className="main" ref={mainRef}>
+        {/* The Transfer page stays mounted while you look at other pages, so a
+            transfer in progress keeps running and nothing you typed is lost. */}
+        <div className="page" hidden={route !== 'transfer'}>
+          <header className="topbar">
+            <div>
+              <h1 tabIndex={-1}>Transfer a playlist</h1>
+              <p className="topbar-sub">Bring a Spotify playlist over to YouTube, one track at a time.</p>
             </div>
+            {isDemo && <span className="demo-badge">Demo data</span>}
+          </header>
 
-            <TrackTable rows={visibleRows} filter={filter} addedIds={addedIds} />
-          </section>
+          <PlaylistInput onLoad={loadPlaylist} disabled={isRunning || addState.status === 'adding'} spotify={spotify} />
 
-          <TransferPanel
-            queue={queue}
-            results={results}
-            counts={counts}
-            cursor={cursor}
-            phase={phase}
-            isRunning={isRunning}
-            finished={finished}
-            destination={destination}
-            trackLimit={trackLimit}
-            totalTracks={playlist.tracks.length}
-            isDemo={isDemo}
-            connection={connection}
-            matchError={matchError}
-            addState={addState}
-            pendingCount={pendingIds.length}
-            includeReview={includeReview}
-            onIncludeReviewChange={setIncludeReview}
-            onAdd={addToYouTube}
-            onDestinationChange={setDestination}
-            onLimitChange={changeLimit}
-            onStart={startTransfer}
-            onStop={() => setPhase('stopped')}
-            onReset={resetTransfer}
-            onShow={setFilter}
-          />
+          <div className="workspace">
+            <section className="panel tracks-panel" aria-labelledby="playlist-title">
+              <PlaylistHeader playlist={playlist} queueLength={queue.length} />
+
+              <div className="filters" role="group" aria-label="Filter tracks by match result">
+                {filterOptions.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className="chip"
+                    aria-pressed={filter === option.id}
+                    onClick={() => setFilter(option.id)}
+                  >
+                    {option.label}
+                    <span className="chip-count">{option.count}</span>
+                  </button>
+                ))}
+              </div>
+
+              <TrackTable rows={visibleRows} filter={filter} addedIds={addedIds} />
+            </section>
+
+            <TransferPanel
+              queue={queue}
+              results={results}
+              counts={counts}
+              cursor={cursor}
+              phase={phase}
+              isRunning={isRunning}
+              finished={finished}
+              destination={destination}
+              trackLimit={trackLimit}
+              totalTracks={playlist.tracks.length}
+              isDemo={isDemo}
+              connection={connection}
+              matchError={matchError}
+              addState={addState}
+              pendingCount={pendingIds.length}
+              includeReview={includeReview}
+              onIncludeReviewChange={setIncludeReview}
+              onAdd={addToYouTube}
+              onDestinationChange={setDestination}
+              onLimitChange={changeLimit}
+              onStart={startTransfer}
+              onStop={() => setPhase('stopped')}
+              onReset={resetTransfer}
+              onShow={setFilter}
+            />
+          </div>
+
+          <YouTubeTestPanel />
         </div>
 
-        <YouTubeTestPanel />
+        {route === 'history' && (
+          <div className="page">
+            <HistoryPage />
+          </div>
+        )}
+        {route === 'match-cache' && (
+          <div className="page">
+            <MatchCachePage youtube={connection} />
+          </div>
+        )}
+        {route === 'settings' && (
+          <div className="page">
+            <SettingsPage youtube={connection} spotify={spotify} onRecheck={() => void refreshConnections()} />
+          </div>
+        )}
       </main>
     </div>
   );
@@ -495,19 +583,19 @@ function Logo() {
   );
 }
 
-const CONNECTION_LABEL: Record<Connection, string> = {
-  checking: 'Checking…',
-  connected: 'Connected',
-  disconnected: 'Not connected',
-  unreachable: 'Offline',
-};
+const RECENT_COUNT = 3;
 
-const SPOTIFY_LABEL: Record<SpotifyConnection, string> = {
-  ...CONNECTION_LABEL,
-  'not-configured': 'Not set up',
-};
+interface SidebarProps {
+  route: Route;
+  youtube: Connection;
+  spotify: SpotifyConnection;
+  /** Matching or adding to YouTube is in progress on the Transfer page. */
+  transferBusy: boolean;
+}
 
-function Sidebar({ youtube, spotify }: { youtube: Connection; spotify: SpotifyConnection }) {
+function Sidebar({ route, youtube, spotify, transferBusy }: SidebarProps) {
+  const recent = useTransferHistory().slice(0, RECENT_COUNT);
+
   return (
     <aside className="sidebar">
       <div className="brand">
@@ -517,15 +605,17 @@ function Sidebar({ youtube, spotify }: { youtube: Connection; spotify: SpotifyCo
 
       <nav aria-label="Main">
         <ul className="nav">
-          {NAV_ITEMS.map((item) => (
-            <li key={item}>
-              <button
-                type="button"
-                className="nav-item"
-                aria-current={item === 'Transfer' ? 'page' : undefined}
-              >
-                {item}
-              </button>
+          {ROUTES.map((item) => (
+            <li key={item.id}>
+              <Link to={item.path} className="nav-item" aria-current={item.id === route ? 'page' : undefined}>
+                {item.label}
+                {item.id === 'transfer' && transferBusy && (
+                  <>
+                    <span className="pulse nav-busy" aria-hidden="true" />
+                    <span className="visually-hidden"> (in progress)</span>
+                  </>
+                )}
+              </Link>
             </li>
           ))}
         </ul>
@@ -533,14 +623,22 @@ function Sidebar({ youtube, spotify }: { youtube: Connection; spotify: SpotifyCo
 
       <div className="sidebar-section">
         <h2 className="sidebar-heading">Recent transfers</h2>
-        <ul className="recent">
-          {RECENT_TRANSFERS.map((item) => (
-            <li key={item.name}>
-              <span className="recent-name">{item.name}</span>
-              <span className="recent-meta">{item.summary}</span>
-            </li>
-          ))}
-        </ul>
+        {recent.length === 0 ? (
+          <p className="recent-empty">Transfers you run will show up here.</p>
+        ) : (
+          <ul className="recent">
+            {recent.map((item) => (
+              <li key={item.id}>
+                <Link to={`${pathFor('history')}#${transferAnchor(item.id)}`} className="recent-link">
+                  <span className="recent-name">{item.playlistName}</span>
+                  <span className="recent-meta">
+                    {item.counts.matched} of {item.tracks.length} matched
+                  </span>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       <div className="sidebar-section connections">

@@ -152,3 +152,49 @@ export async function addVideosToPlaylist(request: {
 export function newTransferId(): string {
   return crypto.randomUUID();
 }
+
+/* ------------------------------------------------------------------ */
+/* Match cache                                                         */
+/* ------------------------------------------------------------------ */
+
+/** A song this session matched whose YouTube result the server has cached. */
+export interface CachedMatch extends TrackMatch {
+  id: string;
+  title: string;
+  artist: string;
+  durationSec: number;
+  /** When the server cached it (ms since epoch). */
+  cachedAt: number;
+}
+
+async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, { ...init, credentials: 'include' });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw backendUnreachable();
+  }
+
+  const data = await readJson<T & ErrorBody>(response);
+  if (!response.ok || !data) {
+    throw new ApiError(data?.error ?? `Request failed (HTTP ${response.status}).`, response.status, data?.reason);
+  }
+  return data;
+}
+
+/** The songs this session matched that are still cached. Reads server memory only. */
+export function fetchMatchCache(signal?: AbortSignal): Promise<{ entries: CachedMatch[]; limit: number }> {
+  return requestJson('/api/youtube/match-cache', { signal });
+}
+
+/** Forgets one cached match, so the next match for that song searches YouTube again. */
+export async function forgetCachedMatch(id: string): Promise<void> {
+  await requestJson(`/api/youtube/match-cache/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** Forgets every cached match this session looked up; returns how many. */
+export async function clearMatchCache(): Promise<number> {
+  const data = await requestJson<{ removed: number }>('/api/youtube/match-cache', { method: 'DELETE' });
+  return data.removed;
+}

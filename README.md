@@ -32,10 +32,10 @@ It is a full-stack TypeScript/JavaScript project: a React dashboard talks to a s
 - **Quota-friendly.** Search results are cached while the server runs, so matching the same songs again costs no YouTube quota.
 - **Demo mode.** A built-in demo playlist (made-up songs, simulated matching) shows the whole flow without signing in to anything.
 - **YouTube connection test.** A small panel checks the YouTube connection and can create a private test playlist.
-
-### Planned (not built yet)
-
-The sidebar's **History**, **Match cache** and **Settings** pages, and the **Recent transfers** list, are visual placeholders with sample data. See [Future improvements](#future-improvements) for other planned work.
+- **History.** Every real (non-demo) transfer is saved in your browser with its per-song results and a link to its YouTube playlist. The sidebar's **Recent transfers** shows the latest three.
+- **Match cache page.** See the YouTube results the server has cached for songs you matched, search and filter them, and forget one (or all) so it's searched again next time.
+- **Settings.** Connection status for Spotify and YouTube, a starting track limit and whether to add "Needs review" songs by default (saved in your browser), and controls for the saved data.
+- **Pages with real URLs.** `/`, `/history`, `/match-cache` and `/settings` work with the browser's back and forward buttons and can be bookmarked. A transfer keeps running while you look at another page.
 
 ## Screenshots
 
@@ -201,6 +201,7 @@ SPOTIFY_CLIENT_SECRET=your-spotify-client-secret
 | `GOOGLE_REDIRECT_URI` | Production | Defaults to `http://localhost:<PORT>/oauth2/callback`. |
 | `NODE_ENV` | Production | Set to `production` when deployed: enables secure cookies and the proxy settings. |
 | `TRUST_PROXY` | No | Production only. Number of proxies in front of the server, default `1`. |
+| `MATCH_CACHE_SWEEP_MS` | No | How often the server drops match-cache claims held by expired sessions, in milliseconds. Defaults to `600000` (10 minutes). |
 
 The server refuses to start without the three required Google/session variables. Without the Spotify variables it still runs, and the dashboard shows Spotify as "Not set up". Locally you don't need any of the production variables; see [DEPLOYMENT.md](DEPLOYMENT.md) for their deployed values.
 
@@ -235,6 +236,9 @@ VITE_API_BASE_URL=http://localhost:3001
 | GET | `/api/youtube/status` | Is YouTube connected in this session? |
 | POST | `/api/youtube/match` | Find the best YouTube video for one song (search only) |
 | POST | `/api/youtube/playlists` | Create a private playlist and add videos (retry-safe with a `transferId`) |
+| GET | `/api/youtube/match-cache` | Cached matches for songs this session looked up |
+| DELETE | `/api/youtube/match-cache/:id` | Forget one cached match |
+| DELETE | `/api/youtube/match-cache` | Forget every cached match this session looked up |
 | GET | `/auth/spotify` | Start Spotify sign-in |
 | GET | `/auth/spotify/callback` | Spotify OAuth callback (on `127.0.0.1`) |
 | GET | `/auth/spotify/complete` | Finishes Spotify sign-in back on `localhost` |
@@ -254,7 +258,13 @@ SyncTune/
 ├── public/                 # Static assets (favicon, icons)
 ├── src/
 │   ├── main.tsx            # React entry point
-│   ├── App.tsx             # Dashboard: playlist input, track table, transfer panel
+│   ├── App.tsx             # App shell and sidebar; Transfer page (playlist input, track table, transfer panel)
+│   ├── HistoryPage.tsx     # Past transfers and their results
+│   ├── MatchCachePage.tsx  # View and manage cached YouTube matches
+│   ├── SettingsPage.tsx    # Accounts, transfer defaults, saved data
+│   ├── router.ts           # Small History-API router for the four pages
+│   ├── transferHistory.ts  # Transfer history saved in localStorage
+│   ├── settings.ts         # Preferences saved in localStorage
 │   ├── App.css             # Dashboard styles
 │   ├── index.css           # Global styles and colour tokens
 │   ├── YouTubeTestPanel.tsx  # YouTube connection test panel
@@ -273,13 +283,13 @@ SyncTune/
 
 - **Spotify only shares songs from your own playlists.** Under Spotify's Development Mode rules, an app can read the songs of playlists you **own or collaborate on**. Playlists by other people return an error, and Spotify-made playlists (Discover Weekly, editorial mixes) can't be read by apps. Workaround: copy the songs into a playlist of your own in Spotify, then import that.
 - **Spotify Development Mode limits.** The app owner needs Spotify Premium, and only a few users (added under User Management) can sign in.
+- **History stays in one browser.** Transfer history and settings are saved in the browser's localStorage, so they don't follow you to another browser or device.
 - **Sessions live in server memory.** Sessions, in-progress transfers and the match cache are lost whenever the backend restarts (locally, or when a free host spins down), which signs everyone out. See [DEPLOYMENT.md](DEPLOYMENT.md#limitations-of-the-free-setup) for the other limits of a free deployment.
 - **YouTube quota.** The default daily quota covers only a few transfers of 20 or so songs.
 - **Matching isn't perfect.** Songs marked "Needs review" deserve a quick look, and the same video can match two different songs.
 - **One direction only.** Transfers go from Spotify (or pasted text) to YouTube.
 - **No disconnect button yet.** You can't sign out of Spotify or YouTube from the dashboard; restarting the backend clears the session.
 - **No automated test suite** is included in the repository yet.
-- Placeholder sidebar pages, as noted under [Features](#features).
 
 ## Future improvements
 
@@ -287,8 +297,8 @@ These are **planned ideas, not finished features**:
 
 - "Disconnect" buttons for Spotify and YouTube, and links from imported songs back to Spotify
 - Let users swap a "Needs review" match for a different search result
-- Persistent sessions and transfer history (database or session store)
-- Working History, Match cache and Settings pages
+- Persistent sessions, match cache and server-side transfer history (database or session store)
+- Reopen a past transfer from History to add more songs to its playlist
 - Automated tests (unit tests for matching, API tests with mocked Spotify/YouTube) and CI
 - More platforms and directions (for example YouTube → Spotify, Apple Music)
 

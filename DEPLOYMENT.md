@@ -30,7 +30,7 @@ SyncTune keeps you signed in with a session cookie set by the backend. Vercel (`
 | How it works | The browser only talks to `<frontend>`. Vercel forwards `/api`, `/auth` and `/oauth2` to Render. | The browser loads the app from `<frontend>` and calls `<backend>` directly. |
 | Session cookie | First-party, `Secure; SameSite=Lax` | Third-party, `Secure; SameSite=None` |
 | Browsers | All | **Chrome and Edge only.** Safari blocks third-party cookies and Firefox partitions them by default, so sign-in won't stick there. |
-| Extra file | A `vercel.json` with your Render URL | None |
+| Extra file | Add your Render URL to `vercel.json` | None (keep the repo's `vercel.json` as is) |
 
 The backend chooses the cookie mode automatically. If `FRONTEND_URL` and `GOOGLE_REDIRECT_URI` share an origin, it uses setup A; otherwise setup B.
 
@@ -100,7 +100,7 @@ On startup the log prints the public settings it is using (mode, frontend URL, G
 
 Skip this step for setup B.
 
-Create `vercel.json` in the repository root, replacing `<backend>` with your Render hostname:
+Replace the contents of `vercel.json` in the repository root with this, replacing `<backend>` with your Render hostname:
 
 ```json
 {
@@ -108,7 +108,8 @@ Create `vercel.json` in the repository root, replacing `<backend>` with your Ren
   "rewrites": [
     { "source": "/api/:path*", "destination": "https://<backend>/api/:path*" },
     { "source": "/auth/:path*", "destination": "https://<backend>/auth/:path*" },
-    { "source": "/oauth2/:path*", "destination": "https://<backend>/oauth2/:path*" }
+    { "source": "/oauth2/:path*", "destination": "https://<backend>/oauth2/:path*" },
+    { "source": "/((?!api/|auth/|oauth2/).*)", "destination": "/index.html" }
   ],
   "headers": [
     { "source": "/api/:path*", "headers": [{ "key": "x-vercel-enable-rewrite-caching", "value": "0" }] },
@@ -118,7 +119,7 @@ Create `vercel.json` in the repository root, replacing `<backend>` with your Ren
 }
 ```
 
-The `x-vercel-enable-rewrite-caching: 0` headers stop Vercel from caching proxied responses, which are per-user. The backend also sends `Cache-Control: no-store` on every response. Commit the file and let Vercel redeploy.
+The last rewrite serves the dashboard for its own pages (`/history`, `/match-cache`, `/settings`), so opening or refreshing one of those links works. It skips `/api`, `/auth` and `/oauth2`, which always go to Render; keep it last anyway. The `x-vercel-enable-rewrite-caching: 0` headers stop Vercel from caching proxied responses, which are per-user. The backend also sends `Cache-Control: no-store` on every response. Commit the file and let Vercel redeploy.
 
 ## 4. Update Google Cloud
 

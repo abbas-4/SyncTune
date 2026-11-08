@@ -23,6 +23,18 @@
   align-items: start;
 }
 
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
+/* The Transfer page stays mounted (hidden) while other pages are shown. */
+.page[hidden] {
+  display: none;
+}
+
 .panel {
   background: var(--surface);
   border: 1px solid var(--line-soft);
@@ -75,14 +87,24 @@
 
 .nav-item {
   position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
   padding: 9px 12px;
   text-align: left;
   font-weight: 500;
   color: var(--text-muted);
+  text-decoration: none;
   background: none;
   border: 0;
   border-radius: var(--radius-sm);
+}
+
+/* Shown on Transfer while matching or adding runs in the background. */
+.nav-busy {
+  flex: none;
+  margin-left: auto;
 }
 
 .nav-item:hover {
@@ -123,9 +145,22 @@
   list-style: none;
 }
 
-.recent li {
+.recent-link {
+  display: block;
   padding: 7px 8px;
+  color: inherit;
+  text-decoration: none;
   border-radius: var(--radius-sm);
+}
+
+.recent-link:hover {
+  background: var(--surface);
+}
+
+.recent-empty {
+  padding: 0 8px;
+  font-size: 0.85rem;
+  color: var(--text-faint);
 }
 
 .recent-name {
@@ -193,6 +228,24 @@
 .topbar-sub {
   margin-top: 4px;
   color: var(--text-muted);
+}
+
+/* Headings get focus when you switch pages; that needs no visible ring. */
+.topbar h1:focus {
+  outline: none;
+}
+
+.topbar-actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.topbar-actions a.btn {
+  text-decoration: none;
 }
 
 .demo-badge {
@@ -344,6 +397,46 @@ select.field {
 
 .btn-link:hover {
   color: var(--green-hover);
+}
+
+.btn-link:disabled {
+  opacity: 0.5;
+}
+
+.btn-link--muted {
+  color: var(--text-muted);
+}
+
+.btn-link--muted:hover {
+  color: var(--text);
+}
+
+.btn-link--danger,
+.btn-link--danger:hover {
+  color: var(--red);
+}
+
+.btn-danger {
+  color: var(--red);
+  background: transparent;
+  border-color: var(--red);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--red-soft);
+}
+
+/* Inline "Are you sure?" for destructive actions */
+.confirm {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.confirm-question {
+  font-size: 0.88rem;
+  color: var(--text-muted);
 }
 
 /* ================================================================ */
@@ -939,6 +1032,229 @@ select.field {
 }
 
 /* ================================================================ */
+/* Pages: shared                                                     */
+/* ================================================================ */
+
+.page-empty {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  padding: 28px 24px;
+}
+
+.page-empty h2 {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.page-empty .hint {
+  max-width: 60ch;
+}
+
+.page-empty a.btn {
+  margin-top: 6px;
+  text-decoration: none;
+}
+
+/* ================================================================ */
+/* History                                                           */
+/* ================================================================ */
+
+.history-list {
+  display: grid;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.history-item {
+  display: grid;
+  gap: 12px;
+  padding: 18px 20px;
+  scroll-margin-top: 20px;
+}
+
+.history-item--focus {
+  border-color: var(--green);
+}
+
+.history-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.history-info {
+  min-width: 0;
+}
+
+.history-name {
+  font-size: 1.1rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.history-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.history-result {
+  font-size: 0.92rem;
+  overflow-wrap: anywhere;
+}
+
+.history-result a {
+  font-weight: 600;
+  color: var(--green);
+  text-underline-offset: 3px;
+}
+
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 20px;
+}
+
+.history-tracks {
+  margin: 0 -20px -18px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* ================================================================ */
+/* Match cache                                                       */
+/* ================================================================ */
+
+.cache-tools {
+  display: grid;
+  gap: 12px;
+  padding: 16px 20px 0;
+}
+
+.cache-search {
+  max-width: 420px;
+}
+
+/* Full-width divider under the chips, like the Transfer page's filters. */
+.cache-filters {
+  margin: 0 -20px;
+}
+
+.tracks .cache-col-song {
+  padding-left: 20px;
+}
+
+.tracks .cache-col-when {
+  white-space: nowrap;
+  font-size: 0.85rem;
+}
+
+.tracks .cache-col-action {
+  padding-right: 20px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cache-footnote {
+  padding: 14px 20px 16px;
+  border-top: 1px solid var(--line-soft);
+}
+
+/* ================================================================ */
+/* Settings                                                          */
+/* ================================================================ */
+
+.settings-section {
+  display: grid;
+  gap: 4px;
+  padding: 18px 20px 8px;
+}
+
+.settings-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+}
+
+.settings-section-head h2 {
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+
+.settings-section .error {
+  padding-bottom: 12px;
+}
+
+.settings-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 24px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.settings-label {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  max-width: 62ch;
+}
+
+.settings-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+}
+
+.settings-control {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.settings-control a.btn {
+  text-decoration: none;
+}
+
+.settings-control select.field {
+  width: auto;
+  min-width: 160px;
+}
+
+.settings-check {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--green);
+}
+
+.settings-code {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ================================================================ */
 /* Responsive                                                        */
 /* ================================================================ */
 
@@ -956,6 +1272,8 @@ select.field {
 @media (max-width: 780px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
+    /* Top bar keeps its height; short pages don't stretch it. */
+    grid-template-rows: auto 1fr;
   }
 
   .sidebar {
@@ -1015,5 +1333,26 @@ select.field {
 
   .match-video {
     max-width: 180px;
+  }
+
+  .topbar--with-actions {
+    flex-direction: column;
+  }
+
+  .topbar-actions {
+    justify-content: flex-start;
+  }
+
+  .settings-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .settings-control {
+    justify-content: flex-start;
+  }
+
+  .cache-search {
+    max-width: none;
   }
 }

@@ -234,8 +234,14 @@ if (IS_PRODUCTION) {
 
 app.use(express.json());
 
+// The same in-memory store express-session uses by default (it still prints
+// its production warning); named so the match cache can check which sessions
+// are still alive.
+const sessionStore = new session.MemoryStore();
+
 app.use(
   session({
+    store: sessionStore,
     name: "synctune.sid",
     secret: process.env.SESSION_SECRET,
     resave: false,
@@ -346,8 +352,130 @@ app.get("/api/youtube/status", (req, res) => {
 // Match one song (title + artist) to a YouTube video. Search only: this never
 // creates or changes anything on YouTube. An uncached song costs about 100
 // quota units, so results are cached in memory while the server runs.
-const matchCache = new Map();
+//
+// The cache is shared by every session (a song's best video is the same for
+// everyone), but each session only sees and manages the songs it looked up
+// itself, so one user never sees another user's songs.
+//
+// Each entry records which sessions use it. Forgetting a song only removes
+// this session's claim: the shared entry is deleted only when no other
+// session uses it, so one user clearing their cache never costs anyone else
+// quota. If others still use it, this session's next match for that song
+// searches YouTube again and caches the result under a key private to this
+// session, leaving the shared entry untouched.
+//
+// Claims expire with their session. A sweep (every MATCH_CACHE_SWEEP_MS)
+// asks the session store which owners still exist and drops the others'
+// claims; forgetting a song checks the other owners the same way first. When
+// a session expires, its private entries are deleted (nothing can reach them
+// any more), while shared entries stay cached for whoever matches them next.
+const matchCache = new Map(); // key -> { track, result, cachedAt, owners: Set<sessionID>, privateTo?: sessionID }
 const MATCH_CACHE_LIMIT = 2000;
+const CACHE_ENTRY_ID_PATTERN = /^[0-9a-f]{16}$/;
+// Must be positive and within Node's timer limit (about 24.8 days): anything
+// else would make setInterval fire every millisecond, so it falls back to 10 min.
+const requestedSweepMs = Number(process.env.MATCH_CACHE_SWEEP_MS);
+const MATCH_CACHE_SWEEP_MS =
+  requestedSweepMs > 0 && requestedSweepMs <= 2 ** 31 - 1 ? requestedSweepMs : 10 * 60 * 1000;
+
+// Whether a session still exists. The store decides: an expired or destroyed
+// session isn't returned. If the store can't answer, assume the session is
+// alive, so an error never removes something another user relies on.
+function isSessionLive(sessionId) {
+  return new Promise((resolve) => {
+    sessionStore.get(sessionId, (error, stored) => resolve(error ? true : Boolean(stored)));
+  });
+}
+
+// Drops claims held by sessions that no longer exist, and deletes private
+// entries belonging to them. Shared entries are kept, even with no owners left.
+async function sweepExpiredCacheOwners() {
+  const ownerIds = new Set();
+  for (const entry of matchCache.values()) {
+    for (const sessionId of entry.owners) ownerIds.add(sessionId);
+  }
+
+  const expired = new Set();
+  for (const sessionId of ownerIds) {
+    if (!(await isSessionLive(sessionId))) expired.add(sessionId);
+  }
+
+  let removedClaims = 0;
+  let deletedPrivateEntries = 0;
+  if (expired.size > 0) {
+    for (const [key, entry] of matchCache) {
+      for (const sessionId of expired) {
+        if (entry.owners.delete(sessionId)) removedClaims++;
+      }
+      if (entry.privateTo && expired.has(entry.privateTo)) {
+        matchCache.delete(key);
+        deletedPrivateEntries++;
+      }
+    }
+  }
+
+  return { expiredSessions: expired.size, removedClaims, deletedPrivateEntries };
+}
+
+// unref: the sweep never keeps the process alive on its own.
+setInterval(async () => {
+  try {
+    const result = await sweepExpiredCacheOwners();
+    // Counts only; session IDs are never logged.
+    if (result.expiredSessions > 0) console.log("Match cache: removed expired sessions' claims", result);
+  } catch (error) {
+    console.error("Match cache sweep failed:", error.message);
+  }
+}, MATCH_CACHE_SWEEP_MS).unref();
+
+// Short, stable id for a cache key, safe to put in a URL. Private keys contain
+// the session ID, so only this hash of them is ever sent to the browser.
+function cacheEntryId(key) {
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 16);
+}
+
+// The cache key this session uses for a song: the shared one, unless this
+// session forgot the shared entry while others still used it.
+function sessionCacheKey(req, sharedKey) {
+  const forgotten = req.session.matchCacheForgotten ?? [];
+  return forgotten.includes(sharedKey) ? `${req.sessionID}|${sharedKey}` : sharedKey;
+}
+
+function rememberCacheKey(req, key) {
+  matchCache.get(key)?.owners.add(req.sessionID);
+  const keys = (req.session.matchCacheKeys ??= []);
+  if (keys.includes(key)) return;
+  keys.push(key);
+  if (keys.length > MATCH_CACHE_LIMIT) keys.shift();
+}
+
+// Drops this session's claim on a cached song. Returns true if the session had it.
+async function forgetCacheKey(req, key) {
+  const keys = req.session.matchCacheKeys ?? [];
+  const index = keys.indexOf(key);
+  if (index === -1) return false;
+  keys.splice(index, 1);
+
+  const entry = matchCache.get(key);
+  if (!entry) return true;
+  entry.owners.delete(req.sessionID);
+
+  // Claims from expired sessions don't count, even if the sweep hasn't run yet.
+  for (const sessionId of [...entry.owners]) {
+    if (!(await isSessionLive(sessionId))) entry.owners.delete(sessionId);
+  }
+
+  if (entry.owners.size === 0) {
+    matchCache.delete(key);
+  } else {
+    // Still used by others: keep it for them, and make this session search
+    // again next time (into its own private key).
+    const forgotten = (req.session.matchCacheForgotten ??= []);
+    if (!forgotten.includes(key)) forgotten.push(key);
+    if (forgotten.length > MATCH_CACHE_LIMIT) forgotten.shift();
+  }
+  return true;
+}
 
 app.post("/api/youtube/match", async (req, res) => {
   if (!req.session.youtubeTokens?.access_token) {
@@ -379,14 +507,13 @@ app.post("/api/youtube/match", async (req, res) => {
     artist: artist.trim(),
     durationSec: Math.round(durationSec),
   };
-  const cacheKey = JSON.stringify([
-    track.title.toLowerCase(),
-    track.artist.toLowerCase(),
-    track.durationSec,
-  ]);
+  const sharedKey = JSON.stringify([track.title.toLowerCase(), track.artist.toLowerCase(), track.durationSec]);
+  const cacheKey = sessionCacheKey(req, sharedKey);
 
-  if (matchCache.has(cacheKey)) {
-    return res.json({ ...matchCache.get(cacheKey), cached: true });
+  const cachedEntry = matchCache.get(cacheKey);
+  if (cachedEntry) {
+    rememberCacheKey(req, cacheKey);
+    return res.json({ ...cachedEntry.result, cached: true });
   }
 
   const { youtube, saveIfRefreshed, wasRefreshed } = youtubeForSession(req);
@@ -425,7 +552,14 @@ app.post("/api/youtube/match", async (req, res) => {
     if (matchCache.size >= MATCH_CACHE_LIMIT) {
       matchCache.delete(matchCache.keys().next().value);
     }
-    matchCache.set(cacheKey, result);
+    matchCache.set(cacheKey, {
+      track,
+      result,
+      cachedAt: Date.now(),
+      owners: new Set(),
+      privateTo: cacheKey === sharedKey ? undefined : req.sessionID,
+    });
+    rememberCacheKey(req, cacheKey);
 
     console.log("Track matched:", {
       track: `${track.artist} - ${track.title}`,
@@ -451,6 +585,52 @@ app.post("/api/youtube/match", async (req, res) => {
       reason: failure.reason,
     });
   }
+});
+
+// The songs this session has matched that are still cached, newest first.
+// Reads server memory only; no YouTube call.
+app.get("/api/youtube/match-cache", (req, res) => {
+  const keys = req.session.matchCacheKeys ?? [];
+  const live = keys.filter((key) => matchCache.has(key));
+  // Drop keys the cache has since evicted.
+  if (live.length !== keys.length) req.session.matchCacheKeys = live;
+
+  const entries = live
+    .map((key) => {
+      const { track, result, cachedAt } = matchCache.get(key);
+      return { id: cacheEntryId(key), ...track, ...result, cachedAt };
+    })
+    .sort((a, b) => b.cachedAt - a.cachedAt);
+
+  res.json({ entries, limit: MATCH_CACHE_LIMIT });
+});
+
+// Forget one cached match, so the next match for that song searches YouTube again.
+app.delete("/api/youtube/match-cache/:id", async (req, res) => {
+  const { id } = req.params;
+  const keys = req.session.matchCacheKeys ?? [];
+  const key = CACHE_ENTRY_ID_PATTERN.test(id)
+    ? keys.find((candidate) => cacheEntryId(candidate) === id)
+    : undefined;
+
+  if (!key || !matchCache.has(key)) {
+    if (key) await forgetCacheKey(req, key);
+    return res.status(404).json({ error: "That song isn’t in your match cache any more." });
+  }
+
+  await forgetCacheKey(req, key);
+  res.json({ removed: 1 });
+});
+
+// Forget every cached match this session looked up. Other sessions keep theirs.
+app.delete("/api/youtube/match-cache", async (req, res) => {
+  const keys = [...(req.session.matchCacheKeys ?? [])];
+  let removed = 0;
+  for (const key of keys) {
+    const live = matchCache.has(key);
+    if ((await forgetCacheKey(req, key)) && live) removed++;
+  }
+  res.json({ removed });
 });
 
 // Create a YouTube playlist and add video IDs to it.
@@ -707,3 +887,6 @@ app.listen(PORT, () => {
     sessionCookie: `${IS_PRODUCTION ? "Secure; " : ""}SameSite=${CROSS_SITE_COOKIE ? "None" : "Lax"}`,
   });
 });
+
+// For tests only: the server starts when this file is loaded, exactly as before.
+module.exports = { matchCache, sweepExpiredCacheOwners };
