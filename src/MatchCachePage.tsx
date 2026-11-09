@@ -158,7 +158,7 @@ export default function MatchCachePage({ youtube }: { youtube: Connection }) {
             {youtube === 'connected'
               ? 'Each song you match on the Transfer page is saved here, so matching it again is free.'
               : 'Connect YouTube and match some songs on the Transfer page; each result is saved here so matching it again is free.'}{' '}
-            The cache lives in the SyncTune server’s memory, so it’s emptied whenever the server restarts.
+            Cached results are kept for a limited time, so the cache empties from time to time.
           </p>
           <Link to="/" className="btn btn-primary">
             Go to Transfer
@@ -238,8 +238,8 @@ export default function MatchCachePage({ youtube }: { youtube: Connection }) {
 
           <p className="hint cache-footnote">
             Forget a song to make SyncTune search YouTube for it again the next time you match it (about 1% of the daily
-            quota). Forgetting only affects your own cache, not anyone else’s. The cache is kept in the server’s memory and holds up to {load.limit.toLocaleString()} songs for
-            everyone using it; the oldest are dropped first and it’s emptied when the server restarts.
+            quota). Forgetting only affects your own cache, not anyone else’s. Cached results are kept for a limited time; when
+            the cache is full, the oldest are dropped first.
           </p>
         </section>
       )}

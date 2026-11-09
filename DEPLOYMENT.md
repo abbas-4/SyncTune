@@ -92,7 +92,8 @@ Notes:
 - **Use a new `SESSION_SECRET`** for production, not your local one. Generate it with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`.
 - **Enter secrets only in Render's dashboard.** Never commit them. `.env` files are ignored by git.
 - **Startup checks:** with `NODE_ENV=production`, the server refuses to start unless `FRONTEND_URL` and `GOOGLE_REDIRECT_URI` are `https://` URLs. Spotify stays off (with a log message) unless `SPOTIFY_REDIRECT_URI` is set too.
-- **`TRUST_PROXY` (optional):** defaults to `1`, meaning one trusted proxy in front of the app. That lets Express see the original HTTPS scheme so it can set the secure cookie. If the logs show *"A request did not arrive over HTTPS"*, adjust it.
+- **`TRUST_PROXY` (optional):** defaults to `1`, meaning one trusted proxy in front of the app. That lets Express see the original HTTPS scheme so it can set the secure cookie, and the visitor's IP address, which the sign-in and API rate limits count by. If the logs show *"A proxied request was not seen as HTTPS"*, adjust it. After the first request, the log prints a `Proxy check` line with the number of addresses in `X-Forwarded-For`; set `TRUST_PROXY` to that number (with setup A, Vercel adds one more hop, so usually `2`). If it's too low, every visitor behind the same proxy shares one rate limit; never set it higher than the real number of proxies, or visitors could fake their address.
+- **`SESSION_SECRET` length:** the server logs a warning in production if it's shorter than 32 characters.
 
 On startup the log prints the public settings it is using (mode, frontend URL, Google redirect URI and cookie mode), never secrets.
 
@@ -114,10 +115,27 @@ Replace the contents of `vercel.json` in the repository root with this, replacin
   "headers": [
     { "source": "/api/:path*", "headers": [{ "key": "x-vercel-enable-rewrite-caching", "value": "0" }] },
     { "source": "/auth/:path*", "headers": [{ "key": "x-vercel-enable-rewrite-caching", "value": "0" }] },
-    { "source": "/oauth2/:path*", "headers": [{ "key": "x-vercel-enable-rewrite-caching", "value": "0" }] }
+    { "source": "/oauth2/:path*", "headers": [{ "key": "x-vercel-enable-rewrite-caching", "value": "0" }] },
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; upgrade-insecure-requests"
+        },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=(), payment=(), usb=()" },
+        { "key": "Strict-Transport-Security", "value": "max-age=63072000; includeSubDomains" },
+        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" }
+      ]
+    }
   ]
 }
 ```
+
+With every request on one origin, the content security policy's `connect-src` only needs `'self'`. (The repository's own `vercel.json`, for setup B, also allows `https://*.onrender.com`, where the dashboard calls the backend directly. You can tighten that to your exact backend host.) Set `TRUST_PROXY=2` on Render for setup A (see step 2).
 
 The last rewrite serves the dashboard for its own pages (`/history`, `/match-cache`, `/settings`), so opening or refreshing one of those links works. It skips `/api`, `/auth` and `/oauth2`, which always go to Render; keep it last anyway. The `x-vercel-enable-rewrite-caching: 0` headers stop Vercel from caching proxied responses, which are per-user. The backend also sends `Cache-Control: no-store` on every response. Commit the file and let Vercel redeploy.
 
@@ -150,6 +168,7 @@ It must match `SPOTIFY_REDIRECT_URI` exactly. In Development Mode, only accounts
    - Setup A: on `<frontend>`, marked Secure, SameSite Lax.
    - Setup B: on `<backend>`, marked Secure, SameSite None.
 5. Load a playlist and click **Find YouTube matches**. Only create a playlist when you mean to.
+6. Open `https://<backend>/api/health` again and check the response headers: no `X-Powered-By`, and `Strict-Transport-Security`, `X-Content-Type-Options` and `Content-Security-Policy` present. On `<frontend>`, the browser console should show no "Refused to load" (content security policy) errors.
 
 If sign-in "works" but the dashboard still says Not connected, the cookie isn't reaching the backend. Check that `FRONTEND_URL` and `VITE_API_BASE_URL` exactly match the address in your browser bar (https, no trailing path), and that you're using setup A for Safari and Firefox.
 
@@ -169,7 +188,7 @@ If sign-in "works" but the dashboard still says Not connected, the cookie isn't 
 | `SPOTIFY_CLIENT_SECRET` | For Spotify | — | From Spotify |
 | `SPOTIFY_REDIRECT_URI` | Production, for Spotify | `http://127.0.0.1:<PORT>/auth/spotify/callback` | See step 2 |
 | `PORT` | No | `3001` | Set by Render |
-| `TRUST_PROXY` | No | *(not used)* | `1` |
+| `TRUST_PROXY` | No | *(not used)* | `1` (setup B), usually `2` (setup A); see step 2 |
 
 **Frontend (Vercel, or `.env.local` locally)**
 

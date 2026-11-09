@@ -11,7 +11,8 @@ const {
   pickBestMatch,
 } = require("./youtubeMatch");
 const { registerSpotifyRoutes } = require("./spotify");
-require("dotenv").config();
+const { createRateLimiter, rateLimitMiddleware } = require("./rateLimit");
+require("dotenv").config({ quiet: true });
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -21,7 +22,7 @@ const IS_PRODUCTION = process.env.NODE_ENV === "production";
 // `npm start`); in production they must be set (see DEPLOYMENT.md).
 const FRONTEND_URL = (process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
 const REDIRECT_URI =
-  process.env.GOOGLE_REDIRECT_URI || "https://synctune-30vx.onrender.com/oauth2/callback";
+  process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/oauth2/callback`;
 
 if (
   !process.env.GOOGLE_CLIENT_ID ||
@@ -42,6 +43,31 @@ if (IS_PRODUCTION) {
       throw new Error(`${name} must be set to an https:// URL when NODE_ENV=production.`);
     }
   }
+
+  // A short secret makes session cookies easier to forge. Warn rather than
+  // refuse to start, so an existing deployment keeps running.
+  if (process.env.SESSION_SECRET.length < 32) {
+    console.warn("SESSION_SECRET is shorter than 32 characters. Replace it with a long random value.");
+  }
+}
+
+// Personal details (song names, channel names) go to the log only during
+// local development, never in production.
+const devOnly = (details) => (IS_PRODUCTION ? {} : details);
+
+// Where OAuth sign-ins end: back on the dashboard with a short result code
+// (connected, denied, expired, failed, busy) that it turns into a message.
+// Never a raw error, and never a token or code.
+function authResultUrl(service, result) {
+  return `${FRONTEND_URL}/?${new URLSearchParams({ [service]: result })}`;
+}
+
+// Constant-time comparison for OAuth state values.
+function sameSecret(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
 const FRONTEND_ORIGIN = new URL(FRONTEND_URL).origin;
@@ -109,34 +135,61 @@ function youtubeForSession(req) {
 // googleapis throws a GaxiosError carrying Google's HTTP status and reason
 // (e.g. quotaExceeded, accessNotConfigured). Pull those out for logs and the
 // dashboard, but never error.config: it holds the Authorization header.
+//
+// Google's own error text can include internal details (such as the Cloud
+// project number), so the dashboard only ever gets a fixed message and one of
+// a few known reason codes. The full detail goes to the server log.
+const PUBLIC_YOUTUBE_REASONS = new Set(["quotaExceeded", "playlistNotFound", "youtubeSignupRequired", "reconnect"]);
+
 function describeGoogleError(error) {
-  const googleError = error.response?.data?.error;
-  const reason = googleError?.errors?.[0]?.reason ?? googleError?.status;
-  const message = googleError?.message ?? error.message;
+  const data = error.response?.data;
+  // API errors are objects; token-endpoint errors are a string ("invalid_grant").
+  const googleError = typeof data?.error === "object" ? data.error : undefined;
+  const tokenError = typeof data?.error === "string" ? data.error : undefined;
+  const reason = tokenError === "invalid_grant" || error.response?.status === 401
+    ? "reconnect"
+    : googleError?.errors?.[0]?.reason ?? googleError?.status;
+  const message = googleError?.message ?? data?.error_description ?? error.message;
 
   let userMessage = null;
-  if (reason === "quotaExceeded") {
+  let httpStatus = googleError || tokenError ? 502 : 500;
+  if (reason === "reconnect") {
+    // Access was revoked or the sign-in expired: the dashboard offers to reconnect.
+    userMessage = "Your YouTube sign-in has expired. Connect YouTube again.";
+    httpStatus = 401;
+  } else if (reason === "quotaExceeded") {
     userMessage =
       "SyncTune has used up today's YouTube API quota. It resets at midnight Pacific time; anything already done is kept.";
+  } else if (reason === "youtubeSignupRequired") {
+    userMessage = "This Google account doesn’t have a YouTube channel yet. Create one on YouTube, then try again.";
   } else if (isTransientYouTubeError(error)) {
-    userMessage = `YouTube was temporarily unavailable (${reason}: ${message}) and still failed after several automatic retries. Wait a minute, then try again.`;
-  } else if (googleError) {
-    userMessage = `YouTube API error${reason ? ` (${reason})` : ""}: ${message}`;
+    userMessage = "YouTube is temporarily unavailable. Wait a minute, then try again.";
+  } else if (googleError || tokenError) {
+    userMessage = "YouTube couldn’t complete this request. Please try again later.";
   }
 
   return {
-    reason,
-    httpStatus: googleError ? 502 : 500,
+    reason: PUBLIC_YOUTUBE_REASONS.has(reason) ? reason : undefined,
+    httpStatus,
     userMessage,
     log: {
       googleStatus: error.response?.status,
       reason,
       message,
-      request: error.config
-        ? `${error.config.method} ${new URL(error.config.url).pathname}`
-        : undefined,
+      request: describeRequest(error.config),
     },
   };
+}
+
+// "POST /youtube/v3/playlists": method and path only. Never the query string
+// (it can hold a token) or headers (they hold the Authorization header).
+function describeRequest(config) {
+  if (!config?.url) return undefined;
+  try {
+    return `${config.method ?? "GET"} ${new URL(config.url).pathname}`;
+  } catch {
+    return config.method;
+  }
 }
 
 // Temporary YouTube failures worth retrying. Notably, playlistItems.insert
@@ -187,10 +240,34 @@ if (IS_PRODUCTION) {
   app.set("trust proxy", Number(process.env.TRUST_PROXY ?? 1));
 }
 
+// Don't advertise the framework.
+app.disable("x-powered-by");
+
+// Security headers. This server only returns JSON, plain text and redirects,
+// so the content policy allows nothing to load or frame it.
+app.use((_req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+    "Cross-Origin-Opener-Policy": "same-origin",
+  });
+  if (IS_PRODUCTION) res.set("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  next();
+});
+
+// The custom header the dashboard sends on every state-changing request (see
+// the CSRF check below).
+const CSRF_HEADER = "X-Requested-With";
+const CSRF_HEADER_VALUE = "SyncTune";
+
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
     credentials: true,
+    methods: ["GET", "POST", "DELETE"],
+    allowedHeaders: ["Content-Type", CSRF_HEADER],
   })
 );
 
@@ -203,13 +280,17 @@ app.use((_req, res, next) => {
 
 // With a SameSite=None cookie, the browser attaches the session to requests
 // from any site, so refuse state-changing requests from other origins.
-// Browsers always send Origin on these; requests without it (curl, scripts)
-// don't carry a browser's cookie.
+// Browsers send Origin on these; if it's missing (some privacy tools strip
+// it), require the dashboard's custom header instead, which another site
+// can't add without passing the CORS check above.
 app.use((req, res, next) => {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
   const origin = req.get("origin");
-  if (origin && origin !== FRONTEND_ORIGIN) {
-    return res.status(403).json({ error: "Request from an unexpected origin." });
+  const allowed = origin
+    ? origin === FRONTEND_ORIGIN
+    : req.get(CSRF_HEADER) === CSRF_HEADER_VALUE;
+  if (!allowed) {
+    return res.status(403).json({ error: "This request isn’t allowed." });
   }
   next();
 });
@@ -218,8 +299,22 @@ if (IS_PRODUCTION) {
   // Only requests that came through a proxy (X-Forwarded-Proto set) matter:
   // Render's own health checks reach the app over plain HTTP without it.
   let warned = false;
+  let reportedHops = false;
   app.use((req, _res, next) => {
     const forwardedProto = req.get("x-forwarded-proto");
+
+    // Rate limits count by req.ip, which is only the visitor's address when
+    // TRUST_PROXY matches the number of proxies. Report the hop count once
+    // (never the addresses) so it can be checked in the logs.
+    if (forwardedProto && !reportedHops) {
+      reportedHops = true;
+      const forwardedFor = req.get("x-forwarded-for");
+      console.log("Proxy check:", {
+        addressesInXForwardedFor: forwardedFor ? forwardedFor.split(",").length : 0,
+        trustProxy: app.get("trust proxy"),
+      });
+    }
+
     if (!req.secure && forwardedProto && !warned) {
       warned = true;
       console.warn(
@@ -232,12 +327,19 @@ if (IS_PRODUCTION) {
   });
 }
 
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 // The same in-memory store express-session uses by default (it still prints
 // its production warning); named so the match cache can check which sessions
 // are still alive.
 const sessionStore = new session.MemoryStore();
+
+// MemoryStore only deletes an expired session when it's next read, so
+// abandoned sessions (with their tokens) would pile up in memory. Listing all
+// sessions makes it check, and delete, every expired one.
+function pruneExpiredSessions() {
+  return new Promise((resolve) => sessionStore.all(() => resolve()));
+}
 
 app.use(
   session({
@@ -255,6 +357,65 @@ app.use(
     },
   })
 );
+
+// Rate limits. Sign-in starts create a session and a pending login each, and
+// YouTube searches and playlist writes spend the shared daily quota, so those
+// get tighter limits than everything else. Counted per IP (as seen through
+// TRUST_PROXY) or per session.
+const RATE_LIMITED_MESSAGE = "You’re doing that too often. Wait a minute, then try again.";
+const limiters = {
+  auth: createRateLimiter({ windowMs: 15 * 60 * 1000, max: 60 }),
+  api: createRateLimiter({ windowMs: 60 * 1000, max: 1800 }),
+  youtubeSearch: createRateLimiter({ windowMs: 60 * 60 * 1000, max: 150 }),
+  playlistWrite: createRateLimiter({ windowMs: 10 * 60 * 1000, max: 150 }),
+};
+
+// Sign-in starts only. Callbacks need a 256-bit state from a start, so
+// guessing them gets nowhere.
+app.get(
+  ["/auth/youtube", "/auth/spotify"],
+  rateLimitMiddleware(limiters.auth, {
+    key: (req) => req.ip,
+    onLimit: (req, res) => res.redirect(authResultUrl(req.path === "/auth/spotify" ? "spotify" : "youtube", "busy")),
+  })
+);
+
+app.use(
+  "/api",
+  rateLimitMiddleware(limiters.api, {
+    key: (req) => req.ip,
+    onLimit: (_req, res) => res.status(429).json({ error: RATE_LIMITED_MESSAGE, reason: "rateLimited" }),
+  })
+);
+
+// Counts one request against a per-session limit; sends the 429 itself and
+// returns false when the limit is reached.
+function withinSessionLimit(limiter, req, res) {
+  const result = limiter.consume(req.sessionID);
+  if (result.allowed) return true;
+  res.set("Retry-After", String(result.retryAfterSec));
+  res.status(429).json({ error: RATE_LIMITED_MESSAGE, reason: "rateLimited" });
+  return false;
+}
+
+// Gives the session a new ID after a sign-in, so a session ID that existed
+// before sign-in (and could have been planted) never carries the tokens.
+// Everything already in the session is kept, and its match-cache claims move
+// to the new ID.
+function rotateSession(req) {
+  const oldId = req.sessionID;
+  const data = { ...req.session };
+  delete data.cookie;
+
+  return new Promise((resolve, reject) => {
+    req.session.regenerate((error) => {
+      if (error) return reject(error);
+      Object.assign(req.session, data);
+      moveCacheClaims(req, oldId, req.sessionID);
+      resolve();
+    });
+  });
+}
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -278,35 +439,28 @@ app.get("/auth/youtube", (req, res) => {
   res.redirect(authorizationUrl);
 });
 
-// Google returns here after the user approves or denies access.
+// Google returns here after the user approves or denies access. Every outcome
+// goes back to the dashboard with a result code; nothing technical is shown.
 app.get("/oauth2/callback", async (req, res) => {
   try {
     if (req.query.error) {
-      return res.status(400).send(
-        "Google authorization was cancelled or denied. You can close this page."
-      );
+      return res.redirect(authResultUrl("youtube", "denied"));
     }
 
-    const returnedState = req.query.state;
     const savedState = req.session.oauthState;
-
-    if (
-      typeof returnedState !== "string" ||
-      !savedState ||
-      returnedState !== savedState
-    ) {
-      return res.status(403).send(
-        "OAuth state verification failed. Please try connecting again."
-      );
+    if (!savedState || !sameSecret(req.query.state, savedState)) {
+      return res.redirect(authResultUrl("youtube", "expired"));
     }
 
     delete req.session.oauthState;
 
     if (typeof req.query.code !== "string") {
-      return res.status(400).send("Google did not return an authorization code.");
+      return res.redirect(authResultUrl("youtube", "failed"));
     }
 
     const { tokens } = await oauth2Client.getToken(req.query.code);
+
+    await rotateSession(req);
     req.session.youtubeTokens = tokens;
 
     // Scopes and token presence only; never log the tokens themselves.
@@ -315,38 +469,49 @@ app.get("/oauth2/callback", async (req, res) => {
       hasRefreshToken: Boolean(tokens.refresh_token),
     });
 
-    req.session.save((error) => {
-      if (error) {
-        console.error("Session save failed:", error.message);
-        return res.status(500).send("Could not save the YouTube connection.");
-      }
-
-      res.redirect(`${FRONTEND_URL}/?youtube=connected`);
-    });
+    await saveSession(req);
+    res.redirect(authResultUrl("youtube", "connected"));
   } catch (error) {
+    // error.message only: never the request, which holds the code.
     console.error("OAuth callback failed:", error.message);
-    res.status(500).send(
-      "YouTube authorization failed. Check the server terminal for details."
-    );
+    res.redirect(authResultUrl("youtube", "failed"));
   }
 });
 
-// Check whether this browser session is connected. Reads the session only
-// (no YouTube API call) and reports token presence, never token values.
-app.get("/api/youtube/status", (req, res) => {
-  const tokens = req.session.youtubeTokens;
-  const hasAccessToken = Boolean(tokens?.access_token);
-  const hasRefreshToken = Boolean(tokens?.refresh_token);
-  const accessTokenExpired = Boolean(
-    tokens?.expiry_date && tokens.expiry_date < Date.now()
-  );
+// Whether this session's YouTube tokens can still be used.
+function youtubeConnected(tokens) {
+  if (!tokens?.access_token) return false;
+  const expired = Boolean(tokens.expiry_date && tokens.expiry_date < Date.now());
+  // An expired access token is still usable when it can be refreshed.
+  return !expired || Boolean(tokens.refresh_token);
+}
 
-  res.json({
-    // An expired access token is still usable when it can be refreshed.
-    connected: hasAccessToken && (!accessTokenExpired || hasRefreshToken),
-    hasRefreshToken,
-    accessTokenExpired,
-  });
+// Check whether this browser session is connected. Reads the session only
+// (no YouTube API call) and never returns token values.
+app.get("/api/youtube/status", (req, res) => {
+  res.json({ connected: youtubeConnected(req.session.youtubeTokens) });
+});
+
+// Disconnect YouTube: revoke SyncTune's access at Google (so the refresh
+// token stops working everywhere) and forget the tokens and in-progress
+// transfers. Playlists already created on YouTube are not touched.
+app.post("/api/youtube/disconnect", async (req, res) => {
+  const tokens = req.session.youtubeTokens;
+  delete req.session.youtubeTokens;
+  delete req.session.transfers;
+
+  const token = tokens?.refresh_token || tokens?.access_token;
+  if (token) {
+    try {
+      await createOAuthClient().revokeToken(token);
+    } catch (error) {
+      // Already revoked or expired at Google; the session forgets it either way.
+      console.warn("Google token revoke failed:", describeGoogleError(error).log);
+    }
+  }
+
+  await saveSessionQuietly(req);
+  res.json({ connected: false });
 });
 
 // Match one song (title + artist) to a YouTube video. Search only: this never
@@ -420,6 +585,7 @@ async function sweepExpiredCacheOwners() {
 // unref: the sweep never keeps the process alive on its own.
 setInterval(async () => {
   try {
+    await pruneExpiredSessions();
     const result = await sweepExpiredCacheOwners();
     // Counts only; session IDs are never logged.
     if (result.expiredSessions > 0) console.log("Match cache: removed expired sessions' claims", result);
@@ -447,6 +613,26 @@ function rememberCacheKey(req, key) {
   if (keys.includes(key)) return;
   keys.push(key);
   if (keys.length > MATCH_CACHE_LIMIT) keys.shift();
+}
+
+// After the session ID changes (rotateSession), moves the old ID's claims to
+// the new one, and re-keys its private entries (their keys start with the ID).
+function moveCacheClaims(req, oldId, newId) {
+  const keys = req.session.matchCacheKeys;
+  if (!Array.isArray(keys)) return;
+
+  req.session.matchCacheKeys = keys.map((key) => {
+    const entry = matchCache.get(key);
+    if (!entry) return key;
+    if (entry.owners.delete(oldId)) entry.owners.add(newId);
+    if (entry.privateTo !== oldId) return key;
+
+    const newKey = newId + key.slice(oldId.length);
+    matchCache.delete(key);
+    entry.privateTo = newId;
+    matchCache.set(newKey, entry);
+    return newKey;
+  });
 }
 
 // Drops this session's claim on a cached song. Returns true if the session had it.
@@ -513,8 +699,12 @@ app.post("/api/youtube/match", async (req, res) => {
   const cachedEntry = matchCache.get(cacheKey);
   if (cachedEntry) {
     rememberCacheKey(req, cacheKey);
-    return res.json({ ...cachedEntry.result, cached: true });
+    // No "cached" flag: it would tell this user that someone else searched for the song.
+    return res.json(cachedEntry.result);
   }
+
+  // Only real searches spend quota, so only they count against this limit.
+  if (!withinSessionLimit(limiters.youtubeSearch, req, res)) return;
 
   const { youtube, saveIfRefreshed, wasRefreshed } = youtubeForSession(req);
 
@@ -562,24 +752,28 @@ app.post("/api/youtube/match", async (req, res) => {
     rememberCacheKey(req, cacheKey);
 
     console.log("Track matched:", {
-      track: `${track.artist} - ${track.title}`,
+      ...devOnly({ track: `${track.artist} - ${track.title}`, videoId: result.videoId }),
       outcome: result.outcome,
       confidence: result.confidence,
-      videoId: result.videoId,
     });
 
     await saveIfRefreshed();
-    res.json({ ...result, cached: false });
+    res.json(result);
   } catch (error) {
     const failure = describeGoogleError(error);
 
     console.error("Track matching failed:", {
       ...failure.log,
-      track: `${track.artist} - ${track.title}`,
+      ...devOnly({ track: `${track.artist} - ${track.title}` }),
       tokensRefreshed: wasRefreshed(),
     });
 
-    await saveIfRefreshed();
+    if (failure.reason === "reconnect") {
+      delete req.session.youtubeTokens;
+      await saveSessionQuietly(req);
+    } else {
+      await saveIfRefreshed();
+    }
     res.status(failure.httpStatus).json({
       error: failure.userMessage ?? "Could not search YouTube for this track.",
       reason: failure.reason,
@@ -639,7 +833,11 @@ app.delete("/api/youtube/match-cache", async (req, res) => {
 // playlist and remembers it in this session; later calls with the same
 // transferId reuse that playlist and skip videos it already added. Without a
 // transferId (the test panel), every call creates a new playlist.
-const TRANSFER_ID_PATTERN = /^[\w-]{8,64}$/;
+// Letters, digits and hyphens (the dashboard sends a UUID). No underscores,
+// so "__proto__" can never be used as a key.
+const TRANSFER_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+// Transfers remembered per session; the oldest is forgotten past this.
+const MAX_TRANSFERS_PER_SESSION = 50;
 const PLAYLIST_ID_PATTERN = /^[\w-]{10,64}$/;
 const transfersInFlight = new Set();
 
@@ -665,8 +863,14 @@ app.post("/api/youtube/playlists", async (req, res) => {
     return res.status(400).json({ error: "A playlist title is required." });
   }
 
+  // YouTube's own limits: 150 characters for a title, 5,000 for a description.
+  if (title.trim().length > 150) {
+    return res.status(400).json({ error: "Playlist names can be at most 150 characters." });
+  }
+
   if (
     typeof description !== "string" ||
+    description.length > 5000 ||
     !["private", "unlisted", "public"].includes(privacyStatus) ||
     !Array.isArray(videoIds) ||
     videoIds.length > 100 ||
@@ -692,11 +896,14 @@ app.post("/api/youtube/playlists", async (req, res) => {
       error: "This transfer is already being added to YouTube. Wait for it to finish.",
     });
   }
+  if (!withinSessionLimit(limiters.playlistWrite, req, res)) return;
   if (lockKey) transfersInFlight.add(lockKey);
 
   const { youtube, wasRefreshed } = youtubeForSession(req);
   const transfers = (req.session.transfers ??= {});
-  let transfer = transferId ? transfers[transferId] : undefined;
+  // Own keys only: a transferId such as "constructor" must not find
+  // something inherited from Object.prototype.
+  let transfer = transferId && Object.hasOwn(transfers, transferId) ? transfers[transferId] : undefined;
   const reusedPlaylist = Boolean(transfer || knownPlaylistId);
   let createdPlaylist = false;
   let added = 0;
@@ -711,7 +918,7 @@ app.post("/api/youtube/playlists", async (req, res) => {
         playlistId: knownPlaylistId,
         addedVideoIds: await listPlaylistVideoIds(youtube, knownPlaylistId),
       };
-      transfers[transferId] = transfer;
+      rememberTransfer(transfers, transferId, transfer);
     }
 
     if (!transfer) {
@@ -737,13 +944,11 @@ app.post("/api/youtube/playlists", async (req, res) => {
       const { channelId, channelTitle } = created.data.snippet ?? {};
 
       transfer = { playlistId, channelId, channelTitle, addedVideoIds: [] };
-      if (transferId) transfers[transferId] = transfer;
+      if (transferId) rememberTransfer(transfers, transferId, transfer);
       createdPlaylist = true;
 
       console.log("Playlist created:", {
-        playlistId,
-        channelId,
-        channelTitle,
+        ...devOnly({ playlistId, channelId, channelTitle }),
         privacyStatus: created.data.status?.privacyStatus,
         transferId,
       });
@@ -778,7 +983,7 @@ app.post("/api/youtube/playlists", async (req, res) => {
 
     if (videoIds.length > 0) {
       console.log("Videos added to playlist:", {
-        playlistId: transfer.playlistId,
+        ...devOnly({ playlistId: transfer.playlistId }),
         added,
         alreadyThere: skippedVideoIds.length,
         totalInTransfer: transfer.addedVideoIds.length,
@@ -801,11 +1006,13 @@ app.post("/api/youtube/playlists", async (req, res) => {
 
     // The remembered playlist was deleted on YouTube: forget it so a retry starts fresh.
     if (transferId && playlistGone) delete transfers[transferId];
+    // The sign-in can't be renewed: forget it so the dashboard offers to reconnect.
+    if (failure.reason === "reconnect") delete req.session.youtubeTokens;
 
     console.error("Playlist update failed:", {
       ...failure.log,
       transferId,
-      playlistId: transfer?.playlistId,
+      ...devOnly({ playlistId: transfer?.playlistId }),
       addedThisRequest: added,
       accessTokenExpired: Boolean(
         tokens.expiry_date && tokens.expiry_date < Date.now()
@@ -820,8 +1027,7 @@ app.post("/api/youtube/playlists", async (req, res) => {
     res.status(failure.httpStatus).json({
       error: playlistGone
         ? "That YouTube playlist no longer exists. Try again to create a new one."
-        : failure.userMessage ??
-          "Could not complete playlist creation. Check the server terminal and YouTube API settings.",
+        : failure.userMessage ?? "Couldn’t finish adding to YouTube. Please try again.",
       reason: failure.reason,
       ...(transfer && !playlistGone ? playlistSummary(transfer) : {}),
     });
@@ -829,6 +1035,12 @@ app.post("/api/youtube/playlists", async (req, res) => {
     if (lockKey) transfersInFlight.delete(lockKey);
   }
 });
+
+function rememberTransfer(transfers, transferId, transfer) {
+  const ids = Object.keys(transfers);
+  if (ids.length >= MAX_TRANSFERS_PER_SESSION) delete transfers[ids[0]];
+  transfers[transferId] = transfer;
+}
 
 function playlistSummary(transfer) {
   return {
@@ -868,9 +1080,35 @@ async function listPlaylistVideoIds(youtube, playlistId) {
 // SPOTIFY_CLIENT_ID/SECRET in .env these routes report "not set up".
 registerSpotifyRoutes(app, {
   port: PORT,
-  frontendUrl: FRONTEND_URL,
   isProduction: IS_PRODUCTION,
   saveSessionQuietly,
+  rotateSession,
+  authResultUrl,
+  sameSecret,
+  devOnly,
+});
+
+// Anything that matched no route: a plain JSON 404, not Express's HTML page.
+app.use((_req, res) => {
+  res.status(404).json({ error: "Not found." });
+});
+
+// Last resort for errors nothing else handled (malformed JSON, a body over
+// the size limit, a bug). The response never includes a stack trace or the
+// error's text; the log gets the message and path only. (Express recognizes
+// an error handler by its four parameters, so `next` must stay.)
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+
+  const status = Number(error.status ?? error.statusCode);
+  if (status >= 400 && status < 500) {
+    return res.status(status).json({
+      error: status === 413 ? "That request is too large." : "That request couldn’t be read.",
+    });
+  }
+
+  console.error("Unhandled error:", { method: req.method, path: req.path, message: error.message });
+  res.status(500).json({ error: "Something went wrong. Please try again." });
 });
 
 app.listen(PORT, () => {

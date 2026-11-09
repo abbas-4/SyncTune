@@ -489,6 +489,8 @@ export default function App() {
             {isDemo && <span className="demo-badge">Demo data</span>}
           </header>
 
+          <SignInNotice />
+
           <PlaylistInput onLoad={loadPlaylist} disabled={isRunning || addState.status === 'adding'} spotify={spotify} />
 
           <div className="workspace">
@@ -541,7 +543,8 @@ export default function App() {
             />
           </div>
 
-          <YouTubeTestPanel />
+          {/* Developer tool: only in local development builds, never in production. */}
+          {import.meta.env.DEV && <YouTubeTestPanel />}
         </div>
 
         {route === 'history' && (
@@ -661,6 +664,73 @@ function Sidebar({ route, youtube, spotify, transferBusy }: SidebarProps) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Sign-in result                                                      */
+/* ------------------------------------------------------------------ */
+
+type SignInService = 'youtube' | 'spotify';
+
+const SERVICE_NAME: Record<SignInService, string> = { youtube: 'YouTube', spotify: 'Spotify' };
+
+/** Message for the result code the server adds after a sign-in (?youtube=connected). */
+function signInMessage(service: SignInService, result: string): { ok: boolean; text: string } | null {
+  const name = SERVICE_NAME[service];
+  switch (result) {
+    case 'connected':
+      return { ok: true, text: `${name} is connected.` };
+    case 'denied':
+      return { ok: false, text: `${name} access wasn’t granted, so nothing was connected.` };
+    case 'expired':
+      return { ok: false, text: `That ${name} sign-in expired or couldn’t be verified. Please connect again.` };
+    case 'busy':
+      return { ok: false, text: 'Too many sign-in attempts. Wait a few minutes, then try again.' };
+    case 'unavailable':
+      return { ok: false, text: `${name} sign-in isn’t available right now.` };
+    case 'not-approved':
+      return {
+        ok: false,
+        text: `Your ${name} account isn’t approved for SyncTune yet. SyncTune is in limited testing, so only invited accounts can connect.`,
+      };
+    case 'failed':
+      return { ok: false, text: `Couldn’t connect ${name}. Please try again.` };
+    default:
+      return null;
+  }
+}
+
+/** Shows how a YouTube or Spotify sign-in went, then tidies the address bar. */
+function SignInNotice() {
+  const [notices] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return (['youtube', 'spotify'] as const).flatMap((service) => {
+      const result = params.get(service);
+      const message = result ? signInMessage(service, result) : null;
+      return message ? [{ service, ...message }] : [];
+    });
+  });
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (!params.has('youtube') && !params.has('spotify')) return;
+    params.delete('youtube');
+    params.delete('spotify');
+    const query = params.toString();
+    replacePath(`${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`);
+  }, []);
+
+  if (notices.length === 0) return null;
+
+  return (
+    <>
+      {notices.map((notice) => (
+        <p key={notice.service} className={notice.ok ? 'source-notice' : 'error'} role={notice.ok ? 'status' : 'alert'}>
+          {notice.text}
+        </p>
+      ))}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Playlist input                                                      */
 /* ------------------------------------------------------------------ */
 
@@ -668,9 +738,8 @@ const SPOTIFY_HINT: Record<SpotifyConnection, string> = {
   checking: 'Checking your Spotify connection…',
   connected: 'Spotify only lets SyncTune read playlists you own or collaborate on.',
   disconnected: 'Connect Spotify to load your playlists. SyncTune only reads them; nothing changes on Spotify.',
-  'not-configured':
-    'Spotify import isn’t set up on the server yet (it needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in server/.env). Paste tracks still works.',
-  unreachable: 'Can’t reach the SyncTune backend, so Spotify can’t be checked.',
+  'not-configured': 'Spotify sign-in isn’t available right now. You can still paste your tracks.',
+  unreachable: 'SyncTune can’t reach its server right now, so Spotify can’t be checked. Try again in a minute.',
 };
 
 function describeSkipped({ episodes, unavailable }: { episodes: number; unavailable: number }): string {

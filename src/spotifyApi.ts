@@ -4,7 +4,7 @@
 /* only receives song titles, artists, albums and lengths.             */
 /* ------------------------------------------------------------------ */
 
-import { API_BASE_URL, ApiError, readJson } from './youtubeApi';
+import { API_BASE_URL, ApiError, GENERIC_ERROR_MESSAGE, SERVER_UNREACHABLE_MESSAGE, apiFetch, readJson } from './youtubeApi';
 
 export const SPOTIFY_CONNECT_URL = `${API_BASE_URL}/auth/spotify`;
 
@@ -49,7 +49,7 @@ export function parsePlaylistId(link: string): string | null {
 
 export async function fetchSpotifyStatus(signal?: AbortSignal): Promise<SpotifyStatus> {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/spotify/status`, { credentials: 'include', signal });
+    const response = await apiFetch('/api/spotify/status', { signal });
     if (!response.ok) return { connection: 'unreachable' };
     const data = await readJson<{ configured?: boolean; connected?: boolean; displayName?: string }>(response);
     if (!data?.configured) return { connection: 'not-configured' };
@@ -60,20 +60,24 @@ export async function fetchSpotifyStatus(signal?: AbortSignal): Promise<SpotifyS
   }
 }
 
-async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, { credentials: 'include', signal });
+    response = await apiFetch(path, init);
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;
-    throw new ApiError(`Couldn’t reach the SyncTune backend at ${API_BASE_URL}. Is the server running?`, 0);
+    throw new ApiError(SERVER_UNREACHABLE_MESSAGE, 0);
   }
 
   const data = await readJson<T & { error?: string; reason?: string }>(response);
   if (!response.ok || !data) {
-    throw new ApiError(data?.error ?? `Spotify request failed (HTTP ${response.status}).`, response.status, data?.reason);
+    throw new ApiError(data?.error ?? GENERIC_ERROR_MESSAGE, response.status, data?.reason);
   }
   return data;
+}
+
+function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return requestJson<T>(path, { signal });
 }
 
 /** The signed-in user's playlists, so they can pick one SyncTune can read. */
@@ -85,4 +89,9 @@ export async function fetchMyPlaylists(signal?: AbortSignal): Promise<SpotifyPla
 /** Reads one playlist's songs. Read-only: never creates anything anywhere. */
 export function importPlaylist(id: string): Promise<ImportedPlaylist> {
   return getJson<ImportedPlaylist>(`/api/spotify/playlists/${encodeURIComponent(id)}`);
+}
+
+/** Disconnects Spotify: the server forgets this browser's Spotify sign-in. */
+export async function disconnectSpotify(): Promise<void> {
+  await requestJson('/api/spotify/disconnect', { method: 'POST' });
 }

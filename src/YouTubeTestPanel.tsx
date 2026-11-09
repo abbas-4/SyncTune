@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { API_BASE_URL, CONNECT_URL, fetchConnection, readJson } from './youtubeApi';
+import { API_BASE_URL, CONNECT_URL, apiFetch, fetchConnection, readJson } from './youtubeApi';
 import type { Connection } from './youtubeApi';
 
 /* ------------------------------------------------------------------ */
@@ -33,7 +33,7 @@ const CONNECTION_PILL: Record<Connection, { label: string; tone: string }> = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Panel                                                               */
+/* Panel (developer tool: App renders it only in local development)    */
 /* ------------------------------------------------------------------ */
 
 export default function YouTubeTestPanel() {
@@ -63,9 +63,8 @@ export default function YouTubeTestPanel() {
     setNotice(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/youtube/playlists`, {
+      const response = await apiFetch('/api/youtube/playlists', {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title: TEST_PLAYLIST_TITLE,
