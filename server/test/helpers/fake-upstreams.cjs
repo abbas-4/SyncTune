@@ -157,4 +157,3 @@ const originalAdapter = Gaxios.prototype._defaultAdapter;
 Gaxios.prototype._defaultAdapter = function (config) {
   return originalAdapter.call(this, { ...config, fetchImplementation: fakeFetch });
 };
-
