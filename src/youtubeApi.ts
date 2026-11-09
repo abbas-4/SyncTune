@@ -5,9 +5,29 @@
 /* ------------------------------------------------------------------ */
 
 // Set VITE_API_BASE_URL at build time for production (it's a public URL, not a
-// secret). Local development falls back to the backend on port 3001.
+// secret). Local development falls back to the backend on port 3001. It's
+// configuration, so the dashboard never displays it.
 export const API_BASE_URL: string = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001').replace(/\/+$/, '');
 export const CONNECT_URL = `${API_BASE_URL}/auth/youtube`;
+
+/** Shown when the backend can't be reached (offline, or the server is waking up). */
+export const SERVER_UNREACHABLE_MESSAGE =
+  'SyncTune can’t reach its server right now. Check your internet connection, then try again in a minute.';
+
+/** Generic fallback when the server answered with an error but no message. */
+export const GENERIC_ERROR_MESSAGE = 'Something went wrong. Please try again.';
+
+/**
+ * fetch() to the SyncTune backend with the session cookie. State-changing
+ * requests also carry a header other sites can't add, which the backend
+ * checks as CSRF protection.
+ */
+export function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const method = (init.method ?? 'GET').toUpperCase();
+  const headers = new Headers(init.headers);
+  if (method !== 'GET' && method !== 'HEAD') headers.set('X-Requested-With', 'SyncTune');
+  return fetch(`${API_BASE_URL}${path}`, { ...init, headers, credentials: 'include' });
+}
 
 export type Connection = 'checking' | 'connected' | 'disconnected' | 'unreachable';
 
@@ -47,10 +67,7 @@ export async function readJson<T>(response: Response): Promise<T | null> {
 
 export async function fetchConnection(signal?: AbortSignal): Promise<Connection> {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/youtube/status`, {
-      credentials: 'include',
-      signal,
-    });
+    const response = await apiFetch('/api/youtube/status', { signal });
     if (!response.ok) return 'unreachable';
     const data = await readJson<{ connected?: boolean }>(response);
     return data?.connected ? 'connected' : 'disconnected';
@@ -73,7 +90,7 @@ export class ApiError extends Error {
 }
 
 function backendUnreachable(): ApiError {
-  return new ApiError(`Couldn’t reach the SyncTune backend at ${API_BASE_URL}. Is the server running?`, 0);
+  return new ApiError(SERVER_UNREACHABLE_MESSAGE, 0);
 }
 
 /** Searches YouTube for one song. Never creates anything. */
@@ -83,9 +100,8 @@ export async function matchTrack(
 ): Promise<TrackMatch> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/api/youtube/match`, {
+    response = await apiFetch('/api/youtube/match', {
       method: 'POST',
-      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         title: track.title,
@@ -102,7 +118,7 @@ export async function matchTrack(
 
   const data = await readJson<TrackMatch & ErrorBody>(response);
   if (!response.ok || !data) {
-    throw new ApiError(data?.error ?? `Matching failed (HTTP ${response.status}).`, response.status, data?.reason);
+    throw new ApiError(data?.error ?? 'Couldn’t search YouTube for this track. Please try again.', response.status, data?.reason);
   }
   return data;
 }
@@ -126,9 +142,8 @@ export async function addVideosToPlaylist(request: {
 }): Promise<AddVideosResult> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/api/youtube/playlists`, {
+    response = await apiFetch('/api/youtube/playlists', {
       method: 'POST',
-      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...request, privacyStatus: 'private' }),
     });
@@ -141,7 +156,7 @@ export async function addVideosToPlaylist(request: {
     return {
       ...data,
       ok: false,
-      error: data?.error ?? `Adding to YouTube failed (HTTP ${response.status}).`,
+      error: data?.error ?? 'Couldn’t finish adding to YouTube. Please try again.',
       status: response.status,
       reason: data?.reason,
     };
@@ -170,7 +185,7 @@ export interface CachedMatch extends TrackMatch {
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, { ...init, credentials: 'include' });
+    response = await apiFetch(path, init);
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;
     throw backendUnreachable();
@@ -178,7 +193,7 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
 
   const data = await readJson<T & ErrorBody>(response);
   if (!response.ok || !data) {
-    throw new ApiError(data?.error ?? `Request failed (HTTP ${response.status}).`, response.status, data?.reason);
+    throw new ApiError(data?.error ?? GENERIC_ERROR_MESSAGE, response.status, data?.reason);
   }
   return data;
 }
@@ -197,4 +212,9 @@ export async function forgetCachedMatch(id: string): Promise<void> {
 export async function clearMatchCache(): Promise<number> {
   const data = await requestJson<{ removed: number }>('/api/youtube/match-cache', { method: 'DELETE' });
   return data.removed;
+}
+
+/** Disconnects YouTube: the server revokes SyncTune's access and forgets the sign-in. */
+export async function disconnectYouTube(): Promise<void> {
+  await requestJson('/api/youtube/disconnect', { method: 'POST' });
 }

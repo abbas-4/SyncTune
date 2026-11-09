@@ -1,12 +1,13 @@
+import { useState } from 'react';
 import ConfirmButton from './ConfirmButton';
 import Link from './Link';
 import PageHeader from './PageHeader';
 import { CONNECTION_LABEL, SPOTIFY_LABEL, plural } from './format';
 import { TRACK_LIMITS, updateSettings, useSettings } from './settings';
-import { SPOTIFY_CONNECT_URL } from './spotifyApi';
+import { SPOTIFY_CONNECT_URL, disconnectSpotify } from './spotifyApi';
 import type { SpotifyStatus } from './spotifyApi';
 import { clearHistory, useTransferHistory } from './transferHistory';
-import { API_BASE_URL, CONNECT_URL } from './youtubeApi';
+import { CONNECT_URL, SERVER_UNREACHABLE_MESSAGE, disconnectYouTube } from './youtubeApi';
 import type { Connection } from './youtubeApi';
 
 interface SettingsPageProps {
@@ -19,6 +20,21 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
   const settings = useSettings();
   const history = useTransferHistory();
   const checking = youtube === 'checking' || spotify.connection === 'checking';
+  const [disconnecting, setDisconnecting] = useState<'spotify' | 'youtube' | null>(null);
+  const [accountError, setAccountError] = useState('');
+
+  async function disconnect(service: 'spotify' | 'youtube') {
+    setDisconnecting(service);
+    setAccountError('');
+    try {
+      await (service === 'spotify' ? disconnectSpotify() : disconnectYouTube());
+    } catch (error) {
+      setAccountError(error instanceof Error ? error.message : 'Couldn’t disconnect. Please try again.');
+    } finally {
+      setDisconnecting(null);
+      onRecheck();
+    }
+  }
 
   return (
     <>
@@ -46,7 +62,7 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
                 {spotify.connection === 'connected'
                   ? `Signed in${spotify.displayName ? ` as ${spotify.displayName}` : ''}. SyncTune only reads your playlists.`
                   : spotify.connection === 'not-configured'
-                    ? 'Not set up on the server (it needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET). Pasting tracks still works.'
+                    ? 'Spotify sign-in isn’t available right now. Pasting tracks still works.'
                     : 'Used to load your playlists. SyncTune never changes anything on Spotify.'}
               </span>
             </div>
@@ -56,6 +72,16 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
                 <a className="btn btn-primary" href={SPOTIFY_CONNECT_URL}>
                   Connect Spotify
                 </a>
+              )}
+              {spotify.connection === 'connected' && (
+                <ConfirmButton
+                  variant="button"
+                  label={disconnecting === 'spotify' ? 'Disconnecting…' : 'Disconnect'}
+                  question="Disconnect Spotify?"
+                  confirmLabel="Disconnect"
+                  onConfirm={() => void disconnect('spotify')}
+                  disabled={disconnecting !== null}
+                />
               )}
             </div>
           </li>
@@ -77,13 +103,29 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
                   Connect YouTube
                 </a>
               )}
+              {youtube === 'connected' && (
+                <ConfirmButton
+                  variant="button"
+                  label={disconnecting === 'youtube' ? 'Disconnecting…' : 'Disconnect'}
+                  question="Disconnect YouTube?"
+                  confirmLabel="Disconnect"
+                  onConfirm={() => void disconnect('youtube')}
+                  disabled={disconnecting !== null}
+                />
+              )}
             </div>
           </li>
         </ul>
 
         {(youtube === 'unreachable' || spotify.connection === 'unreachable') && (
           <p className="error" role="alert">
-            Couldn’t reach the SyncTune backend at {API_BASE_URL}. Make sure it’s running, then check again.
+            {SERVER_UNREACHABLE_MESSAGE}
+          </p>
+        )}
+
+        {accountError && (
+          <p className="error" role="alert">
+            {accountError}
           </p>
         )}
       </section>
@@ -180,7 +222,7 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
             <div className="settings-label">
               <span className="settings-name">Match cache</span>
               <span className="hint">
-                Saved YouTube results for songs you’ve matched, kept in the server’s memory until it restarts.
+                Saved YouTube results for songs you’ve matched. They’re kept on SyncTune’s server for a limited time.
               </span>
             </div>
             <div className="settings-control">
@@ -190,17 +232,6 @@ export default function SettingsPage({ youtube, spotify, onRecheck }: SettingsPa
             </div>
           </li>
 
-          <li className="settings-row">
-            <div className="settings-label">
-              <span className="settings-name">Backend</span>
-              <span className="hint">
-                The SyncTune server this dashboard talks to. Set <code>VITE_API_BASE_URL</code> at build time to change it.
-              </span>
-            </div>
-            <div className="settings-control">
-              <code className="settings-code">{API_BASE_URL}</code>
-            </div>
-          </li>
         </ul>
       </section>
     </>

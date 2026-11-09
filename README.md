@@ -31,10 +31,10 @@ It is a full-stack TypeScript/JavaScript project: a React dashboard talks to a s
 - **Progress and results.** A live progress bar, per-song results with filters, and a summary of what was added and what couldn't be matched.
 - **Quota-friendly.** Search results are cached while the server runs, so matching the same songs again costs no YouTube quota.
 - **Demo mode.** A built-in demo playlist (made-up songs, simulated matching) shows the whole flow without signing in to anything.
-- **YouTube connection test.** A small panel checks the YouTube connection and can create a private test playlist.
+- **YouTube connection test (development only).** In `npm run dev`, a small panel checks the YouTube connection and can create a private test playlist. It isn't included in production builds.
 - **History.** Every real (non-demo) transfer is saved in your browser with its per-song results and a link to its YouTube playlist. The sidebar's **Recent transfers** shows the latest three.
 - **Match cache page.** See the YouTube results the server has cached for songs you matched, search and filter them, and forget one (or all) so it's searched again next time.
-- **Settings.** Connection status for Spotify and YouTube, a starting track limit and whether to add "Needs review" songs by default (saved in your browser), and controls for the saved data.
+- **Settings.** Connection status for Spotify and YouTube with **Disconnect** buttons (disconnecting YouTube also revokes SyncTune's access at Google), a starting track limit and whether to add "Needs review" songs by default (saved in your browser), and controls for the saved data.
 - **Pages with real URLs.** `/`, `/history`, `/match-cache` and `/settings` work with the browser's back and forward buttons and can be bookmarked. A transfer keeps running while you look at another page.
 
 ## Screenshots
@@ -234,6 +234,7 @@ VITE_API_BASE_URL=http://localhost:3001
 | GET | `/auth/youtube` | Start Google sign-in |
 | GET | `/oauth2/callback` | Google OAuth callback |
 | GET | `/api/youtube/status` | Is YouTube connected in this session? |
+| POST | `/api/youtube/disconnect` | Revoke SyncTune's Google access and forget the YouTube sign-in |
 | POST | `/api/youtube/match` | Find the best YouTube video for one song (search only) |
 | POST | `/api/youtube/playlists` | Create a private playlist and add videos (retry-safe with a `transferId`) |
 | GET | `/api/youtube/match-cache` | Cached matches for songs this session looked up |
@@ -243,8 +244,23 @@ VITE_API_BASE_URL=http://localhost:3001
 | GET | `/auth/spotify/callback` | Spotify OAuth callback (on `127.0.0.1`) |
 | GET | `/auth/spotify/complete` | Finishes Spotify sign-in back on `localhost` |
 | GET | `/api/spotify/status` | Is Spotify set up and connected? |
+| POST | `/api/spotify/disconnect` | Forget the Spotify sign-in |
 | GET | `/api/spotify/playlists` | Your Spotify playlists, marked by whether they can be read |
 | GET | `/api/spotify/playlists/:id` | One playlist's songs (title, artists, album, length) |
+
+OAuth callbacks always send the browser back to the dashboard with a short result code (for example `/?youtube=connected` or `/?spotify=denied`), which the dashboard turns into a message. They never show a raw error.
+
+### Security
+
+- **Secrets stay on the server.** Client secrets, OAuth tokens and the session secret live only in server-side environment variables and the server's session store. API responses report connection status as booleans, never token values, and logs never include tokens, codes or secrets. In production, logs also leave out song, playlist and channel names.
+- **Sessions:** an `HttpOnly` cookie (`Secure` in production), with a new session ID after every sign-in. Expired sessions are swept from memory every few minutes.
+- **CSRF:** state-changing requests (POST, DELETE) must come from `FRONTEND_URL`'s origin; if a browser omits `Origin`, the dashboard's `X-Requested-With: SyncTune` header is required instead. CORS allows only `FRONTEND_URL`, with credentials.
+- **OAuth:** a 256-bit `state` tied to the session that started sign-in, compared in constant time and used once.
+- **Rate limits** (in memory, per server instance): 60 sign-in starts per IP per 15 minutes, 1,800 API requests per IP per minute, 150 uncached YouTube searches per session per hour, and 150 playlist writes per session per 10 minutes.
+- **Errors:** responses carry a short friendly message and, at most, a known reason code. Google's and Spotify's own error text, stack traces and unknown routes' HTML pages never reach the browser.
+- **Headers:** the API sends `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a deny-all CSP and (in production) HSTS. `vercel.json` gives the dashboard a CSP and the same framing and sniffing protection.
+
+Run the backend's security tests with `npm test` in `server/`. They start the server against fake Google and Spotify endpoints, so they need no credentials and make no network calls.
 
 ## Project structure
 
@@ -267,14 +283,16 @@ SyncTune/
 │   ├── settings.ts         # Preferences saved in localStorage
 │   ├── App.css             # Dashboard styles
 │   ├── index.css           # Global styles and colour tokens
-│   ├── YouTubeTestPanel.tsx  # YouTube connection test panel
+│   ├── YouTubeTestPanel.tsx  # YouTube connection test panel (development builds only)
 │   ├── youtubeApi.ts       # Calls to the backend's YouTube routes
 │   └── spotifyApi.ts       # Calls to the backend's Spotify routes
 ├── server/
 │   ├── server.js           # Express app: sessions, Google OAuth, YouTube routes
 │   ├── spotify.js          # Spotify OAuth and playlist import routes
 │   ├── youtubeMatch.js     # Song-to-video scoring (pure functions)
-│   └── package.json        # Backend dependencies; `npm start`
+│   ├── rateLimit.js        # In-memory rate limiter
+│   ├── test/               # Security tests (`npm test`), with fake Google/Spotify upstreams
+│   └── package.json        # Backend dependencies; `npm start`, `npm test`
 ├── app.js, styles.css      # Earlier standalone prototype, not used by the React app
 └── README.md
 ```
@@ -288,23 +306,23 @@ SyncTune/
 - **YouTube quota.** The default daily quota covers only a few transfers of 20 or so songs.
 - **Matching isn't perfect.** Songs marked "Needs review" deserve a quick look, and the same video can match two different songs.
 - **One direction only.** Transfers go from Spotify (or pasted text) to YouTube.
-- **No disconnect button yet.** You can't sign out of Spotify or YouTube from the dashboard; restarting the backend clears the session.
-- **No automated test suite** is included in the repository yet.
+- **Spotify tokens can't be revoked by SyncTune.** Disconnecting Spotify makes the server forget the sign-in; to remove SyncTune's access entirely, remove it under *Manage apps* in your Spotify account.
+- **Tests cover the backend only.** `server/` has security tests; the dashboard has none yet beyond type-checking and linting.
 
 ## Future improvements
 
 These are **planned ideas, not finished features**:
 
-- "Disconnect" buttons for Spotify and YouTube, and links from imported songs back to Spotify
+- Links from imported songs back to Spotify
 - Let users swap a "Needs review" match for a different search result
 - Persistent sessions, match cache and server-side transfer history (database or session store)
 - Reopen a past transfer from History to add more songs to its playlist
-- Automated tests (unit tests for matching, API tests with mocked Spotify/YouTube) and CI
+- More automated tests (unit tests for matching, dashboard tests) and CI
 - More platforms and directions (for example YouTube → Spotify, Apple Music)
 
 ## Contributing
 
-This is a personal portfolio project, but suggestions are welcome. Open an issue to report a bug or propose an idea, or open a pull request. Before submitting, please make sure `npm run lint` and `npm run build` pass, and never commit `.env` files or credentials.
+This is a personal portfolio project, but suggestions are welcome. Open an issue to report a bug or propose an idea, or open a pull request. Before submitting, please make sure `npm run lint`, `npm run build` and `npm test` (in `server/`) pass, and never commit `.env` files or credentials.
 
 ## License
 

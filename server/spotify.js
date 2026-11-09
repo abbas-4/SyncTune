@@ -38,8 +38,8 @@ function friendlyMessage(error, context) {
     const wait = Number(error.retryAfter);
     return `Spotify is limiting requests right now. Try again${wait ? ` in ${wait} seconds` : " shortly"}.`;
   }
-  if (/not be registered|developer\.spotify\.com/i.test(error.message)) {
-    return "Your Spotify account isn’t allowed to use this app yet. In the Spotify developer dashboard, add it under User Management, then connect again.";
+  if (isNotApproved(error)) {
+    return "Your Spotify account isn’t approved for SyncTune yet. SyncTune is in limited testing, so only invited accounts can connect.";
   }
   if (context === "items" && error.status === 403) {
     return "Spotify only lets SyncTune read songs from playlists you own or collaborate on. To transfer this one, copy its songs into a playlist of your own in Spotify, then load that.";
@@ -47,11 +47,20 @@ function friendlyMessage(error, context) {
   if (context === "playlist" && error.status === 404) {
     return "Spotify couldn’t find that playlist. Check the link. Playlists made by Spotify itself (like Discover Weekly or editorial mixes) can’t be read by apps.";
   }
-  if (error.status === 401) {
+  if (error.status === 401 || error.reason === "reconnect" || error.reason === "invalid_grant") {
     return "Your Spotify sign-in has expired. Connect Spotify again.";
   }
-  return `Spotify error${error.status ? ` (${error.status})` : ""}: ${error.message}`;
+  // Spotify's own error text stays in the server log.
+  return "Spotify couldn’t complete this request. Please try again in a moment.";
 }
+
+// Spotify Development Mode rejects accounts not on the app's user list.
+function isNotApproved(error) {
+  return /not be registered|developer\.spotify\.com/i.test(error.message);
+}
+
+// Reason codes the dashboard may see; anything else stays in the log.
+const PUBLIC_REASONS = new Set(["notConfigured", "notConnected", "reconnect", "rateLimited"]);
 
 // Turns playlist entries into dashboard tracks. Skips podcast episodes and
 // songs Spotify no longer returns (removed or unavailable).
@@ -83,7 +92,10 @@ function toTracks(entries, startIndex = 0) {
   return { tracks, episodes, unavailable };
 }
 
-function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessionQuietly }) {
+function registerSpotifyRoutes(
+  app,
+  { port, isProduction, saveSessionQuietly, rotateSession, authResultUrl, sameSecret, devOnly }
+) {
   const clientId = process.env.SPOTIFY_CLIENT_ID;
   const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
   const redirectUri =
@@ -109,13 +121,18 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
   }
 
   // Sign-ins in progress, keyed by their random state. The same state is also
-  // saved in the session that started the sign-in.
+  // saved in the session that started the sign-in. Capped, so a flood of
+  // sign-in starts can't use up memory; the oldest are dropped first.
   const pendingLogins = new Map();
+  const MAX_PENDING_LOGINS = 1000;
 
   function prunePendingLogins() {
     const now = Date.now();
     for (const [state, login] of pendingLogins) {
       if (now - login.createdAt > HANDOFF_TTL_MS) pendingLogins.delete(state);
+    }
+    while (pendingLogins.size >= MAX_PENDING_LOGINS) {
+      pendingLogins.delete(pendingLogins.keys().next().value);
     }
   }
 
@@ -215,8 +232,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
   function requireSpotify(req, res) {
     if (!configured) {
       res.status(503).json({
-        error:
-          "Spotify isn’t set up on the server yet. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to server/.env and restart it.",
+        error: "Spotify sign-in isn’t available right now. You can still paste your tracks.",
         reason: "notConfigured",
       });
       return false;
@@ -236,15 +252,17 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
     }
     const status =
       error.reason === "invalid_grant" ? 401 : [401, 403, 404, 429].includes(error.status) ? error.status : 502;
-    res.status(status).json({ error: friendlyMessage(error, context), reason: error.reason });
+    const reason = status === 401 ? "reconnect" : status === 429 ? "rateLimited" : error.reason;
+    res.status(status).json({
+      error: friendlyMessage(error, context),
+      reason: PUBLIC_REASONS.has(reason) ? reason : undefined,
+    });
   }
 
   // 1. Start sign-in (on the API origin, with the dashboard's session cookie).
   app.get("/auth/spotify", (req, res) => {
     if (!configured) {
-      return res
-        .status(503)
-        .send("Spotify isn’t set up yet. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to server/.env, then restart the server.");
+      return res.redirect(authResultUrl("spotify", "unavailable"));
     }
 
     prunePendingLogins();
@@ -264,7 +282,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
     req.session.save((error) => {
       if (error) {
         console.error("Session save failed:", error.message);
-        return res.status(500).send("Could not start Spotify sign-in.");
+        return res.redirect(authResultUrl("spotify", "failed"));
       }
       res.redirect(authorizeUrl.toString());
     });
@@ -278,21 +296,13 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
     const { state, code, error } = req.query;
     const login = typeof state === "string" ? pendingLogins.get(state) : undefined;
 
-    if (!login || Date.now() - login.createdAt > HANDOFF_TTL_MS) {
-      return res
-        .status(403)
-        .send("This Spotify sign-in link is invalid or has expired. Start again from the SyncTune dashboard.");
+    if (!login || login.result || Date.now() - login.createdAt > HANDOFF_TTL_MS) {
+      return res.redirect(authResultUrl("spotify", "expired"));
     }
 
     if (error || typeof code !== "string") {
       pendingLogins.delete(state);
-      return res
-        .status(400)
-        .send(
-          error === "access_denied"
-            ? "Spotify access was cancelled. You can close this page."
-            : "Spotify did not return an authorization code."
-        );
+      return res.redirect(authResultUrl("spotify", error === "access_denied" ? "denied" : "failed"));
     }
 
     try {
@@ -317,32 +327,43 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
     } catch (callbackError) {
       pendingLogins.delete(state);
       logFailure("Spotify sign-in failed:", callbackError, { step: "callback" });
-      res.status(502).send(`Spotify sign-in failed. ${friendlyMessage(callbackError, "signin")}`);
+      res.redirect(authResultUrl("spotify", isNotApproved(callbackError) ? "not-approved" : "failed"));
     }
   });
 
   // 3. Back with the session that started the sign-in. Only that session
   // (whose saved state matches) can claim the parked tokens.
-  app.get("/auth/spotify/complete", (req, res) => {
+  app.get("/auth/spotify/complete", async (req, res) => {
     const { state } = req.query;
     const login = typeof state === "string" ? pendingLogins.get(state) : undefined;
 
-    if (!login?.result || req.session.spotifyOAuthState !== state) {
-      return res.status(403).send("Spotify sign-in verification failed. Please try connecting again.");
+    if (!login?.result || !sameSecret(state, req.session.spotifyOAuthState)) {
+      return res.redirect(authResultUrl("spotify", "expired"));
     }
 
     pendingLogins.delete(state);
     delete req.session.spotifyOAuthState;
-    req.session.spotifyTokens = login.result.tokens;
-    req.session.spotifyUser = login.result.user;
 
-    req.session.save((error) => {
-      if (error) {
-        console.error("Session save failed:", error.message);
-        return res.status(500).send("Could not save the Spotify connection.");
-      }
-      res.redirect(`${frontendUrl}/?spotify=connected`);
-    });
+    try {
+      await rotateSession(req);
+      req.session.spotifyTokens = login.result.tokens;
+      req.session.spotifyUser = login.result.user;
+      await new Promise((resolve, reject) => req.session.save((error) => (error ? reject(error) : resolve())));
+      res.redirect(authResultUrl("spotify", "connected"));
+    } catch (error) {
+      console.error("Session save failed:", error.message);
+      res.redirect(authResultUrl("spotify", "failed"));
+    }
+  });
+
+  // Disconnect Spotify: forget this session's Spotify tokens and account name.
+  // (Spotify has no API to revoke a token; people can remove SyncTune under
+  // "Manage apps" in their Spotify account.)
+  app.post("/api/spotify/disconnect", async (req, res) => {
+    delete req.session.spotifyTokens;
+    delete req.session.spotifyUser;
+    await saveSessionQuietly(req);
+    res.json({ connected: false });
   });
 
   // Whether Spotify is set up on the server, and connected in this session.
@@ -424,8 +445,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
       }
 
       console.log("Spotify playlist loaded:", {
-        playlistId: id,
-        name: meta.name,
+        ...devOnly({ playlistId: id, name: meta.name }),
         songs: tracks.length,
         total,
         skippedEpisodes: episodes,
@@ -441,7 +461,7 @@ function registerSpotifyRoutes(app, { port, frontendUrl, isProduction, saveSessi
         skipped: { episodes, unavailable },
       });
     } catch (error) {
-      logFailure("Spotify playlist import failed:", error, { playlistId: id, step });
+      logFailure("Spotify playlist import failed:", error, { ...devOnly({ playlistId: id }), step });
       sendError(req, res, error, step);
     }
   });
